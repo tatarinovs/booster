@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -51,6 +52,38 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+
+# ---------------------------------------------------------------------------
+# Helper functions to handle Windows file locking behavior
+# ---------------------------------------------------------------------------
+async def safe_unlink(path: Path, max_retries: int = 5, delay: float = 0.5):
+    """Safely unlink a file with retries for Windows WinError 32."""
+    if not path.exists():
+        return
+    for i in range(max_retries):
+        try:
+            path.unlink()
+            return
+        except PermissionError:
+            if i < max_retries - 1:
+                await asyncio.sleep(delay)
+            else:
+                raise
+
+async def safe_replace(src_path: Path, dest_path: Path, max_retries: int = 5, delay: float = 0.5):
+    """Safely replace/rename a file with retries for Windows WinError 32."""
+    for i in range(max_retries):
+        try:
+            # os.replace is safer than path.replace on Windows for atomicity
+            os.replace(src_path, dest_path)
+            return
+        except PermissionError:
+            if i < max_retries - 1:
+                await asyncio.sleep(delay)
+            else:
+                raise
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +201,23 @@ def validate_windows_dir_name(name: str) -> str:
     return clean[:255] or "unnamed"
 
 
+def _to_plain_text(content: list) -> str:
+    result = []
+    for item in content:
+        if isinstance(item, BoostyTextDto):
+            result.append(item.content)
+        elif isinstance(item, BoostyLinkDto):
+            result.append(f"{item.content} ({item.url})")
+        elif isinstance(item, BoostyListDto):
+            for list_item in item.items:
+                if isinstance(list_item, dict):
+                    text = list_item.get("content", "")
+                    result.append(f"\n• {text}")
+                else:
+                    result.append(f"\n• {list_item}")
+    return "".join(result)
+
+
 # ---------------------------------------------------------------------------
 # API models (simplified from boosty_downloader)
 # ---------------------------------------------------------------------------
@@ -217,28 +267,7 @@ class BoostyFileDto:
     title: str
 
 
-@dataclass
-class BoostyTextDto:
-    content: str
-    modificator: str
-
-
-@dataclass
-class BoostyLinkDto:
-    content: str
-    url: str
-
-
-@dataclass
-class BoostyListDto:
-    style: str
-    items: list = field(default_factory=list)
-
-
-@dataclass
-class BoostyPostTextDto:
-    content: list = field(default_factory=list)
-
+# Removed text DTOs to simplify parsing
 
 @dataclass
 class BoostyPostDto:
@@ -248,7 +277,7 @@ class BoostyPostDto:
     publish_time: int
     title: Optional[str] = None
     signed_query: str = ""
-    text_content: BoostyPostTextDto = field(default_factory=BoostyPostTextDto)
+    text_content: list = field(default_factory=list)
     media: list = field(default_factory=list)
 
 
@@ -262,6 +291,7 @@ class BoostyExtraDto:
 class BoostyPostsListDto:
     extra: BoostyExtraDto
     data: list = field(default_factory=list)
+    total: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -299,17 +329,18 @@ def _to_plain_text(item_list: list) -> str:
         return lines
 
     for item in item_list:
-        if hasattr(item, "url"):  # BoostyLinkDto
-            text, _, _ = _parse_boosty_text(item.content)
-            result.append(f"{text} (ссылка: {item.url})")
-        elif hasattr(item, "modificator"):  # BoostyTextDto
-            if item.modificator == "BLOCK_END":
+        t = item.get("type")
+        if t == "link":
+            text, _, _ = _parse_boosty_text(item.get("content"))
+            result.append(f"{text} (ссылка: {item.get('url', '')})")
+        elif t in ("text", "header"):
+            if item.get("modificator") == "BLOCK_END":
                 result.append("\n")
             else:
-                text, _, _ = _parse_boosty_text(item.content)
+                text, _, _ = _parse_boosty_text(item.get("content"))
                 result.append(text)
-        elif hasattr(item, "items"):  # BoostyListDto
-            result.extend(process_list(item.items))
+        elif t == "list":
+            result.extend(process_list(item.get("items", [])))
     return "".join(result)
 
 
@@ -373,19 +404,9 @@ class BoostyClient:
                 size=media["size"],
                 title=media.get("title", ""),
             )
-        if t in ("text", "header"):
-            return BoostyTextDto(
-                content=media.get("content", ""),
-                modificator=media.get("modificator", ""),
-            )
-        if t == "link":
-            return BoostyLinkDto(content=media.get("content", ""), url=media.get("url", ""))
-        if t == "list":
-            return BoostyListDto(style=media.get("style", ""), items=media.get("items", []))
         return None
 
     def _wrap_post(self, content: dict) -> BoostyPostDto:
-        text_content = BoostyPostTextDto()
         result = BoostyPostDto(
             has_access=content.get("hasAccess", False),
             id=content["id"],
@@ -395,14 +416,13 @@ class BoostyClient:
             signed_query=content.get("signedQuery", ""),
         )
         for media in content.get("data", []):
-            wrapped = self._wrap_media(media)
-            if wrapped is None:
-                continue
-            if isinstance(wrapped, (BoostyTextDto, BoostyLinkDto, BoostyListDto)):
-                text_content.content.append(wrapped)
+            t = media.get("type")
+            if t in ("text", "header", "link", "list"):
+                result.text_content.append(media)
             else:
-                result.media.append(wrapped)
-        result.text_content = text_content
+                wrapped = self._wrap_media(media)
+                if wrapped is not None:
+                    result.media.append(wrapped)
         return result
 
     async def get_post_info(self, author: str, post_id: str) -> BoostyPostDto:
@@ -412,6 +432,15 @@ class BoostyClient:
                 resp.raise_for_status()
                 content = await resp.json()
         return self._wrap_post(content)
+
+    async def get_blog_total_posts(self, author: str) -> int:
+        url = f"{API_BASE}/v1/blog/{author}"
+        async with aiohttp.ClientSession(headers=self._headers()) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                content = await resp.json()
+                count_obj = content.get("count", {})
+                return count_obj.get("posts", 0)
 
     async def get_posts_list(
         self, author: str, limit: int = POSTS_PAGE_LIMIT, offset: Optional[str] = None
@@ -427,23 +456,23 @@ class BoostyClient:
         extra = content["extra"]
         result = BoostyPostsListDto(
             extra=BoostyExtraDto(is_last=extra["isLast"], offset=extra.get("offset", "")),
+            total=extra.get("total", 0)  # Still keep this as fallback
         )
         for post in content["data"]:
             result.data.append(self._wrap_post(post))
         return result
 
-    async def fetch_all_posts(self, author: str) -> list[BoostyPostDto]:
-        all_posts = []
+    async def fetch_posts_lazy(self, author: str):
+        """Async generator that yields pages of posts (full BoostyPostsListDto)."""
         offset = None
         while True:
             page = await self.get_posts_list(author, limit=POSTS_PAGE_LIMIT, offset=offset)
-            all_posts.extend(page.data)
+            yield page
             if page.extra.is_last:
                 break
             offset = page.extra.offset
             if not offset:
                 break
-        return all_posts
 
 
 # ---------------------------------------------------------------------------
@@ -461,25 +490,45 @@ class DownloadItem:
 
 def build_download_items(post: BoostyPostDto, post_path: Path) -> list[DownloadItem]:
     items = []
-    for m in post.media:
+    # Using enumerate with 1-based index and formatting with leading zeros (e.g. 001, 002)
+    # assuming less than 1000 media items per post is common
+    for index, m in enumerate(post.media, start=1):
+        prefix = f"{index:03d}_"
         if isinstance(m, BoostyImageDto):
-            items.append(DownloadItem(url=m.url, path=post_path / f"{m.id}.jpg", media_type="photo"))
+            items.append(DownloadItem(url=m.url, path=post_path / f"{prefix}{m.id}.jpg", media_type="photo"))
         elif isinstance(m, BoostyVideoDto):
             for q in VIDEO_QUALITY_GRADE:
                 info = m.player_urls.get(q)
                 if info and info.url:
-                    path = post_path / validate_windows_dir_name(m.get_title())
+                    title = m.get_title()
+                    path = post_path / validate_windows_dir_name(f"{prefix}{title}")
                     items.append(DownloadItem(url=info.url, path=path, fetch_size=True, media_type="video"))
                     break
         elif isinstance(m, BoostyAudioDto) and post.signed_query:
             url = sign_url(m.url, post.signed_query)
-            path = post_path / validate_windows_dir_name(m.get_title())
+            title = m.get_title()
+            path = post_path / validate_windows_dir_name(f"{prefix}{title}")
             items.append(DownloadItem(url=url, path=path, media_type="audio"))
         elif isinstance(m, BoostyFileDto) and post.signed_query:
             url = sign_url(m.url, post.signed_query)
-            path = post_path / validate_windows_dir_name(m.title)
+            title = m.title
+            path = post_path / validate_windows_dir_name(f"{prefix}{title}")
             items.append(DownloadItem(url=url, path=path, media_type="file"))
     return items
+
+
+@dataclass
+class DownloadContext:
+    client: "BoostyClient"
+    session: aiohttp.ClientSession
+    cdn_session: aiohttp.ClientSession
+    author_dir: Path
+    failed_path: Path
+    semaphore: asyncio.Semaphore
+    post_pbar: Optional[tqdm_asyncio] = None
+    byte_pbar: Optional[tqdm_asyncio] = None
+    stats: Optional["DownloadStats"] = None
+    total_posts: int = 0
 
 
 @dataclass
@@ -499,66 +548,147 @@ class DownloadStats:
         return self.photos_skipped + self.videos_skipped + self.other_skipped
 
 
-def _update_stats(stats: Optional[DownloadStats], media_type: str, skipped: bool, error: bool) -> None:
-    if stats is None:
+def _update_stats(ctx: DownloadContext, media_type: str, skipped: bool, error: bool) -> None:
+    if getattr(ctx, "stats", None) is None:
         return
+    st = ctx.stats
     if error:
-        stats.errors += 1
+        st.errors += 1
         return
     if media_type == "photo":
         if skipped:
-            stats.photos_skipped += 1
+            st.photos_skipped += 1
         else:
-            stats.photos_downloaded += 1
+            st.photos_downloaded += 1
     elif media_type == "video":
         if skipped:
-            stats.videos_skipped += 1
+            st.videos_skipped += 1
         else:
-            stats.videos_downloaded += 1
+            st.videos_downloaded += 1
     else:
         if skipped:
-            stats.other_skipped += 1
+            st.other_skipped += 1
         else:
-            stats.other_downloaded += 1
+            st.other_downloaded += 1
 
 
 async def download_file(
-    session: aiohttp.ClientSession,
+    ctx: DownloadContext,
     item: DownloadItem,
-    failed_path: Path,
-    pbar: Optional[tqdm_asyncio] = None,
-    semaphore: Optional[asyncio.Semaphore] = None,
-    stats: Optional[DownloadStats] = None,
+    referer: Optional[str] = None,
 ) -> bool:
     if item.path.exists():
-        _update_stats(stats, item.media_type, skipped=True, error=False)
+        _update_stats(ctx, item.media_type, skipped=True, error=False)
         return True
 
-    async def _do_download() -> bool:
-        try:
-            async with session.get(item.url) as resp:
-                resp.raise_for_status()
-                size = resp.content_length if item.fetch_size else None
-                if pbar is not None and size is not None:
-                    pbar.total = (pbar.total or 0) + size
-                async with aiofiles.open(item.path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                        if chunk:
-                            await f.write(chunk)
-                            if pbar is not None:
-                                pbar.update(len(chunk))
-            _update_stats(stats, item.media_type, skipped=False, error=False)
-            return True
-        except Exception as e:
-            logger.exception("Download failed %s: %s", item.url, e)
-            line = f"{item.path}\t{item.url}\n"
-            async with aiofiles.open(failed_path, "a", encoding="utf-8") as f:
-                await f.write(line)
-            _update_stats(stats, item.media_type, skipped=False, error=True)
-            return False
+    MAX_RETRIES = 5
+    RETRY_DELAY = 3
 
-    if semaphore is not None:
-        async with semaphore:
+    async def _do_download() -> bool:
+        part_path = item.path.with_suffix(item.path.suffix + ".part")
+        
+        # Try to resume from existing .part file
+        initial_size = 0
+        if part_path.exists():
+            initial_size = part_path.stat().st_size
+            
+        part_deleted_this_run = False
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            downloaded_bytes = 0
+            size_added_to_total = False
+            total_size_expected = None
+            headers = {}
+            if initial_size > 0:
+                headers["Range"] = f"bytes={initial_size}-"
+            if referer:
+                headers["Referer"] = referer
+
+            parsed = urlparse(item.url)
+            hostname = parsed.hostname or ""
+            is_cdn = "boosty.to" not in hostname
+            dl_session = ctx.cdn_session if is_cdn else ctx.session
+
+            timeout = aiohttp.ClientTimeout(total=None, sock_read=120, sock_connect=30)
+            
+            try:
+                async with dl_session.get(item.url, headers=headers, timeout=timeout) as resp:
+                    resp.raise_for_status()
+                    
+                    # Handle full vs partial content responses
+                    if resp.status == 206: # Partial content
+                        total_size_expected = initial_size + (resp.content_length or 0)
+                        open_mode = "ab" # Append
+                    else:
+                        # Server didn't respect Range or we started from 0
+                        total_size_expected = resp.content_length if item.fetch_size else None
+                        initial_size = 0
+                        open_mode = "wb"
+
+                    if ctx.byte_pbar is not None and total_size_expected is not None and not size_added_to_total:
+                        ctx.byte_pbar.total = (ctx.byte_pbar.total or 0) + total_size_expected - ctx.byte_pbar.n  # adjusting total
+                        size_added_to_total = True
+
+                    async with aiofiles.open(part_path, open_mode) as f:
+                        try:
+                            async for chunk in resp.content.iter_chunked(256 * 1024):
+                                if chunk:
+                                    await f.write(chunk)
+                                    len_chunk = len(chunk)
+                                    downloaded_bytes += len_chunk
+                                    initial_size += len_chunk
+                                    if ctx.byte_pbar is not None:
+                                        ctx.byte_pbar.update(len_chunk)
+                        except (aiohttp.ClientPayloadError, aiohttp.ClientError, asyncio.TimeoutError) as payload_err:
+                            if downloaded_bytes > 0:
+                                raise RuntimeError("Server closed connection prematurely. Will retry.") from payload_err
+                            else:
+                                raise RuntimeError(f"CDN dropped connection: {payload_err}") from payload_err
+
+                # Validate if we got the expected size
+                if item.fetch_size and total_size_expected is not None and initial_size < total_size_expected:
+                   raise RuntimeError(f"Incomplete file: Expected {total_size_expected} bytes, got {initial_size} bytes.")
+
+                # Success
+                await safe_replace(part_path, item.path)
+                _update_stats(ctx, item.media_type, skipped=False, error=False)
+                return True
+                
+            except Exception as e:
+                err_str = str(e)
+                # If CDN returns 400, it might be due to a bad Range request OR an expired URL.
+                is_400 = "400" in err_str or "Bad Request" in err_str or "403" in err_str or "Forbidden" in err_str
+                
+                if is_400:
+                    if initial_size > 0 and not part_deleted_this_run:
+                        logger.info("CDN returned 400/403 with Range header. Deleting .part and restarting from scratch for %s", item.path.name)
+                        await safe_unlink(part_path)
+                        initial_size = 0
+                        part_deleted_this_run = True
+                        continue  # Try immediately from scratch
+                    else:
+                        # 400/403 with NO range header (initial_size = 0) means the URL is just expired/invalid.
+                        logger.error("Download failed (likely expired URL) %s: %s", item.url, e)
+                        break  # Break out of the retry loop, no point hammering an expired URL
+
+                if attempt < MAX_RETRIES:
+                    logger.warning("Retry %d/%d for %s due to error: %s (Resuming from %s bytes)", 
+                                   attempt, MAX_RETRIES, item.path.name, e, initial_size)
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    logger.error("Download failed after %d attempts %s: %s", MAX_RETRIES, item.url, e)
+                    break # To write to failed log
+
+            # If loop breaks, it means failure
+            
+        line = f"{item.path}\t{item.url}\n"
+        async with aiofiles.open(ctx.failed_path, "a", encoding="utf-8") as f:
+            await f.write(line)
+        _update_stats(ctx, item.media_type, skipped=False, error=True)
+        return False
+
+    if ctx.semaphore is not None:
+        async with ctx.semaphore:
             return await _do_download()
     return await _do_download()
 
@@ -569,37 +699,34 @@ async def download_file(
 
 
 def get_post_dir(author_dir: Path, post: BoostyPostDto) -> Path:
+    # Format date as YY-MM-DD
+    post_date = datetime.fromtimestamp(post.publish_time, tz=timezone.utc).strftime("%y-%m-%d")
     title_part = validate_windows_dir_name(post.title or "post")
-    return author_dir / f"{title_part}_{post.id}"
+    return author_dir / f"{post_date}_{title_part}_{post.id}"
 
 
 async def process_post(
-    client: BoostyClient,
+    ctx: DownloadContext,
     author: str,
     post: BoostyPostDto,
-    author_dir: Path,
-    failed_path: Path,
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
-    pbar: Optional[tqdm_asyncio] = None,
     post_index: int = 0,
-    total_posts: int = 0,
-    stats: Optional[DownloadStats] = None,
 ) -> None:
     if not post.has_access:
         logger.warning("No access to post %s, skipping", post.id)
+        if ctx.post_pbar is not None:
+            ctx.post_pbar.update(1)
         return
-    post_dir = get_post_dir(author_dir, post)
+    post_dir = get_post_dir(ctx.author_dir, post)
     post_dir.mkdir(parents=True, exist_ok=True)
 
-    if pbar is not None and total_posts > 0:
-        pbar.set_postfix(post=f"{post_index}/{total_posts}", refresh=True)
+    if ctx.post_pbar is not None:
+        ctx.post_pbar.set_description(f"Processing post {post_index}/{ctx.total_posts or '??'}")
 
     # Save text
     content_file = post_dir / CONTENT_FILENAME
-    if not content_file.exists() and post.text_content.content:
+    if not content_file.exists() and post.text_content:
         try:
-            text = _to_plain_text(post.text_content.content)
+            text = _to_plain_text(post.text_content)
             if post.title:
                 text = f"{post.title}\n\n{text}"
             post_time = datetime.fromtimestamp(post.publish_time, tz=timezone.utc)
@@ -607,17 +734,28 @@ async def process_post(
             async with aiofiles.open(content_file, "w", encoding="utf-8") as f:
                 await f.write(text)
         except Exception as e:
-            logger.exception("Failed to save post text for %s: %s", post.id, e)
+            logger.error("Failed to save post text for %s: %s", post.id, e)
 
     items = build_download_items(post, post_dir)
     if not items:
+        if ctx.post_pbar is not None:
+            ctx.post_pbar.update(1)
         return
+    
+    post_url = f"https://boosty.to/{author}/posts/{post.id}"
+    
     await asyncio.gather(
         *[
-            download_file(session, item, failed_path, pbar, semaphore, stats)
+            download_file(
+                ctx,
+                item, 
+                referer=post_url if "boosty.to" not in item.url else None
+            )
             for item in items
         ]
     )
+    if ctx.post_pbar is not None:
+        ctx.post_pbar.update(1)
 
 
 async def run(
@@ -632,28 +770,55 @@ async def run(
     stats = DownloadStats()
 
     client = BoostyClient(auth_token=token)
-    logger.info("Fetching posts list for %s...", author)
-    posts = await client.fetch_all_posts(author)
-    logger.info("Found %d posts.", len(posts))
-
+    logger.info("Fetching blog info for %s...", author)
+    total_posts = await client.get_blog_total_posts(author)
+    
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
-    total_posts = len(posts)
-    with tqdm_asyncio(unit="B", unit_scale=True, desc="Downloading") as pbar:
+    
+    post_index = 1
+    # Dual progress bars: one for overall posts, one for aggregate raw download speed
+    with tqdm_asyncio(total=total_posts, unit="post", desc="Posts   ", position=0) as post_pbar, \
+         tqdm_asyncio(unit="B", unit_scale=True, desc="Download", position=1, leave=False) as byte_pbar:
+        # Create sessions
+        # Primary session for Boosty API (authenticated)
+        # CDN session for external links (MUST have Referer - tests show okcdn requires it or fails with 400)
         async with aiohttp.ClientSession(
             headers=client._headers(), timeout=timeout
-        ) as session:
-            for i, post in enumerate(posts, start=1):
+        ) as session, aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+        ) as cdn_session:
+            
+            ctx = DownloadContext(
+                client=client,
+                session=session,
+                cdn_session=cdn_session,
+                author_dir=author_dir,
+                failed_path=failed_path,
+                semaphore=semaphore,
+                post_pbar=post_pbar,
+                byte_pbar=byte_pbar,
+                stats=stats,
+                total_posts=total_posts
+            )
+
+            async for page in client.fetch_posts_lazy(author):
                 if cancel_event.is_set():
-                    logger.info("Interrupt requested, stopping after current post.")
                     break
-                await process_post(
-                    client, author, post, author_dir, failed_path,
-                    session, semaphore, pbar,
-                    post_index=i,
-                    total_posts=total_posts,
-                    stats=stats,
-                )
+                
+                # Update total if it changed (e.g. new post published)
+                if page.total > 0:
+                    post_pbar.total = page.total
+                    ctx.total_posts = page.total
+                
+                for post in page.data:
+                    if cancel_event.is_set():
+                        break
+                    await process_post(
+                        ctx, author, post, post_index=post_index
+                    )
+                    post_index += 1
 
     logger.info("Done. Output: %s", author_dir)
     if failed_path.exists():
