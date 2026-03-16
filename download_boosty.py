@@ -12,14 +12,13 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import aiofiles
 import aiohttp
@@ -35,7 +34,6 @@ TOKEN_FILENAME = ".boosty_token"
 FAILED_FILENAME = "failed.txt"
 CONTENT_FILENAME = "content.txt"
 API_BASE = "https://api.boosty.to"
-CHUNK_SIZE = 153_600
 DOWNLOAD_TIMEOUT = 3600
 POSTS_PAGE_LIMIT = 20
 MAX_CONCURRENT_DOWNLOADS = 5
@@ -201,22 +199,6 @@ def validate_windows_dir_name(name: str) -> str:
     return clean[:255] or "unnamed"
 
 
-def _to_plain_text(content: list) -> str:
-    result = []
-    for item in content:
-        if isinstance(item, BoostyTextDto):
-            result.append(item.content)
-        elif isinstance(item, BoostyLinkDto):
-            result.append(f"{item.content} ({item.url})")
-        elif isinstance(item, BoostyListDto):
-            for list_item in item.items:
-                if isinstance(list_item, dict):
-                    text = list_item.get("content", "")
-                    result.append(f"\n• {text}")
-                else:
-                    result.append(f"\n• {list_item}")
-    return "".join(result)
-
 
 # ---------------------------------------------------------------------------
 # API models (simplified from boosty_downloader)
@@ -351,10 +333,8 @@ def _to_plain_text(item_list: list) -> str:
 
 class BoostyClient:
     def __init__(self, auth_token: Optional[AuthToken] = None,
-                 chunk_size: int = CHUNK_SIZE,
                  timeout: int = DOWNLOAD_TIMEOUT):
         self.auth_token = auth_token
-        self.chunk_size = chunk_size
         self.timeout = timeout
         self._base_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -362,6 +342,7 @@ class BoostyClient:
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
         }
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def _headers(self) -> dict:
         h = dict(self._base_headers)
@@ -369,6 +350,15 @@ class BoostyClient:
             h["Authorization"] = f"Bearer {self.auth_token.authorization}"
             h["Cookie"] = self.auth_token.cookie
         return h
+
+    async def __aenter__(self) -> "BoostyClient":
+        self._session = aiohttp.ClientSession(headers=self._headers())
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        if self._session:
+            await self._session.close()
+            self._session = None
 
     def _wrap_media(self, media: dict):
         t = media.get("type")
@@ -427,20 +417,18 @@ class BoostyClient:
 
     async def get_post_info(self, author: str, post_id: str) -> BoostyPostDto:
         url = f"{API_BASE}/v1/blog/{author}/post/{post_id}"
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                content = await resp.json()
+        async with self._session.get(url) as resp:
+            resp.raise_for_status()
+            content = await resp.json()
         return self._wrap_post(content)
 
     async def get_blog_total_posts(self, author: str) -> int:
         url = f"{API_BASE}/v1/blog/{author}"
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                content = await resp.json()
-                count_obj = content.get("count", {})
-                return count_obj.get("posts", 0)
+        async with self._session.get(url) as resp:
+            resp.raise_for_status()
+            content = await resp.json()
+        count_obj = content.get("count", {})
+        return count_obj.get("posts", 0)
 
     async def get_posts_list(
         self, author: str, limit: int = POSTS_PAGE_LIMIT, offset: Optional[str] = None
@@ -449,10 +437,9 @@ class BoostyClient:
         if offset:
             params["offset"] = offset
         url = f"{API_BASE}/v1/blog/{author}/post/"
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                content = await resp.json()
+        async with self._session.get(url, params=params) as resp:
+            resp.raise_for_status()
+            content = await resp.json()
         extra = content["extra"]
         result = BoostyPostsListDto(
             extra=BoostyExtraDto(is_last=extra["isLast"], offset=extra.get("offset", "")),
@@ -539,6 +526,7 @@ class DownloadStats:
     videos_skipped: int = 0
     other_downloaded: int = 0
     other_skipped: int = 0
+    posts_no_access: int = 0
     errors: int = 0
 
     def total_downloaded(self) -> int:
@@ -549,7 +537,7 @@ class DownloadStats:
 
 
 def _update_stats(ctx: DownloadContext, media_type: str, skipped: bool, error: bool) -> None:
-    if getattr(ctx, "stats", None) is None:
+    if ctx.stats is None:
         return
     st = ctx.stats
     if error:
@@ -594,6 +582,12 @@ async def download_file(
             
         part_deleted_this_run = False
 
+        parsed = urlparse(item.url)
+        hostname = parsed.hostname or ""
+        is_cdn = "boosty.to" not in hostname
+        dl_session = ctx.cdn_session if is_cdn else ctx.session
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=120, sock_connect=30)
+
         for attempt in range(1, MAX_RETRIES + 1):
             downloaded_bytes = 0
             size_added_to_total = False
@@ -603,13 +597,6 @@ async def download_file(
                 headers["Range"] = f"bytes={initial_size}-"
             if referer:
                 headers["Referer"] = referer
-
-            parsed = urlparse(item.url)
-            hostname = parsed.hostname or ""
-            is_cdn = "boosty.to" not in hostname
-            dl_session = ctx.cdn_session if is_cdn else ctx.session
-
-            timeout = aiohttp.ClientTimeout(total=None, sock_read=120, sock_connect=30)
             
             try:
                 async with dl_session.get(item.url, headers=headers, timeout=timeout) as resp:
@@ -687,10 +674,8 @@ async def download_file(
         _update_stats(ctx, item.media_type, skipped=False, error=True)
         return False
 
-    if ctx.semaphore is not None:
-        async with ctx.semaphore:
-            return await _do_download()
-    return await _do_download()
+    async with ctx.semaphore:
+        return await _do_download()
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +698,8 @@ async def process_post(
 ) -> None:
     if not post.has_access:
         logger.warning("No access to post %s, skipping", post.id)
+        if ctx.stats is not None:
+            ctx.stats.posts_no_access += 1
         if ctx.post_pbar is not None:
             ctx.post_pbar.update(1)
         return
@@ -769,56 +756,52 @@ async def run(
     failed_path = author_dir / FAILED_FILENAME
     stats = DownloadStats()
 
-    client = BoostyClient(auth_token=token)
-    logger.info("Fetching blog info for %s...", author)
-    total_posts = await client.get_blog_total_posts(author)
-    
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-    timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
-    
-    post_index = 1
-    # Dual progress bars: one for overall posts, one for aggregate raw download speed
-    with tqdm_asyncio(total=total_posts, unit="post", desc="Posts   ", position=0) as post_pbar, \
-         tqdm_asyncio(unit="B", unit_scale=True, desc="Download", position=1, leave=False) as byte_pbar:
-        # Create sessions
-        # Primary session for Boosty API (authenticated)
-        # CDN session for external links (MUST have Referer - tests show okcdn requires it or fails with 400)
-        async with aiohttp.ClientSession(
-            headers=client._headers(), timeout=timeout
-        ) as session, aiohttp.ClientSession(
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
-        ) as cdn_session:
-            
-            ctx = DownloadContext(
-                client=client,
-                session=session,
-                cdn_session=cdn_session,
-                author_dir=author_dir,
-                failed_path=failed_path,
-                semaphore=semaphore,
-                post_pbar=post_pbar,
-                byte_pbar=byte_pbar,
-                stats=stats,
-                total_posts=total_posts
-            )
+    async with BoostyClient(auth_token=token) as client:
+        logger.info("Fetching blog info for %s...", author)
+        total_posts = await client.get_blog_total_posts(author)
 
-            async for page in client.fetch_posts_lazy(author):
-                if cancel_event.is_set():
-                    break
-                
-                # Update total if it changed (e.g. new post published)
-                if page.total > 0:
-                    post_pbar.total = page.total
-                    ctx.total_posts = page.total
-                
-                for post in page.data:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+
+        post_index = 1
+        # Dual progress bars: one for overall posts, one for aggregate raw download speed
+        with tqdm_asyncio(total=total_posts, unit="post", desc="Posts   ", position=0) as post_pbar, \
+             tqdm_asyncio(unit="B", unit_scale=True, desc="Download", position=1, leave=False) as byte_pbar:
+            # CDN session for external links (MUST have Referer - tests show okcdn requires it or fails with 400)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+            ) as cdn_session:
+
+                ctx = DownloadContext(
+                    client=client,
+                    session=client._session,
+                    cdn_session=cdn_session,
+                    author_dir=author_dir,
+                    failed_path=failed_path,
+                    semaphore=semaphore,
+                    post_pbar=post_pbar,
+                    byte_pbar=byte_pbar,
+                    stats=stats,
+                    total_posts=total_posts
+                )
+
+                async for page in client.fetch_posts_lazy(author):
                     if cancel_event.is_set():
                         break
-                    await process_post(
-                        ctx, author, post, post_index=post_index
-                    )
-                    post_index += 1
+
+                    # Update total if it changed (e.g. new post published)
+                    if page.total > 0:
+                        post_pbar.total = page.total
+                        ctx.total_posts = page.total
+
+                    for post in page.data:
+                        if cancel_event.is_set():
+                            break
+                        await process_post(
+                            ctx, author, post, post_index=post_index
+                        )
+                        post_index += 1
 
     logger.info("Done. Output: %s", author_dir)
     if failed_path.exists():
@@ -830,13 +813,24 @@ def _print_stats(stats: DownloadStats) -> None:
     print("\n" + "=" * 50)
     print("Статистика загрузки")
     print("=" * 50)
-    print(f"  Фото:     загружено {stats.photos_downloaded}, пропущено {stats.photos_skipped}")
-    print(f"  Видео:    загружено {stats.videos_downloaded}, пропущено {stats.videos_skipped}")
+
+    # Use 15 chars for consistent label alignment
+    def fmt(label, d, s):
+        return f"  {label:<15} загружено {str(d):<5} пропущено {s}"
+
+    print(fmt("Фото:", stats.photos_downloaded, stats.photos_skipped))
+    print(fmt("Видео:", stats.videos_downloaded, stats.videos_skipped))
+
     other = stats.other_downloaded + stats.other_skipped
     if other:
-        print(f"  Прочее:   загружено {stats.other_downloaded}, пропущено {stats.other_skipped}")
-    print(f"  Ошибок:   {stats.errors}")
-    print(f"  Итого:    загружено {stats.total_downloaded()}, пропущено {stats.total_skipped()}")
+        print(fmt("Прочее:", stats.other_downloaded, stats.other_skipped))
+
+    if stats.posts_no_access:
+        print(f"  {'Нет доступа:':<15} {stats.posts_no_access}")
+
+    print(f"  {'Ошибок:':<15} {stats.errors}")
+
+    print(fmt("Итого:", stats.total_downloaded(), stats.total_skipped()))
     print("=" * 50)
 
 
