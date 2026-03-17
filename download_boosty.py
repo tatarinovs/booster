@@ -44,10 +44,22 @@ VIDEO_QUALITY_GRADE = ("ultra_hd", "full_hd", "high", "medium", "low")
 # Logging
 # ---------------------------------------------------------------------------
 
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm_asyncio.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+# Configure logging to use tqdm.write to avoid breaking progress bars
+tqdm_handler = TqdmLoggingHandler()
+tqdm_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+    handlers=[tqdm_handler]
 )
 logger = logging.getLogger(__name__)
 
