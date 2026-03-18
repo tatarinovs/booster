@@ -211,6 +211,20 @@ def validate_windows_dir_name(name: str) -> str:
     return clean[:255] or "unnamed"
 
 
+def extract_nickname(input_str: str) -> str:
+    """Extract author nickname from string or full URL."""
+    input_str = input_str.strip()
+    if not input_str:
+        return ""
+    # Look for boosty.to/nickname or just shorthand nickname
+    # Handles https://boosty.to/alias, boosty.to/alias, or just alias
+    match = re.search(r"(?:boosty\.to/)([^/?#]+)", input_str)
+    if match:
+        return match.group(1)
+    # If no URL pattern found, just clean the string from slashes
+    return input_str.replace("/", "").strip()
+
+
 
 # ---------------------------------------------------------------------------
 # API models (simplified from boosty_downloader)
@@ -363,6 +377,35 @@ class BoostyClient:
             h["Cookie"] = self.auth_token.cookie
         return h
 
+    async def _get_with_retry(self, url: str, params: Optional[dict] = None) -> dict:
+        """Helper to perform GET requests with retries on transient server errors (5xx)."""
+        max_retries = 5
+        base_delay = 2
+        
+        for attempt in range(1, max_retries + 1):
+            if not self._session:
+                raise RuntimeError("BoostyClient session not initialized. Use 'async with' context.")
+                
+            try:
+                # Use the session that is managed by the client or created in run()
+                async with self._session.get(url, params=params, headers=self._headers()) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                is_transient = True
+                status = getattr(e, 'status', None)
+                if status is not None and status < 500:
+                    is_transient = False # 4xx are usually not transient (Auth, Not Found, etc.)
+                
+                if not is_transient or attempt == max_retries:
+                    logger.error(f"API request failed to {url} after {attempt} attempts: {e}")
+                    raise
+                
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning(f"API request to {url} failed with {e}. Retrying in {delay}s (Attempt {attempt}/{max_retries})...")
+                await asyncio.sleep(delay)
+        return {}
+
     async def __aenter__(self) -> "BoostyClient":
         self._session = aiohttp.ClientSession(headers=self._headers())
         return self
@@ -429,16 +472,12 @@ class BoostyClient:
 
     async def get_post_info(self, author: str, post_id: str) -> BoostyPostDto:
         url = f"{API_BASE}/v1/blog/{author}/post/{post_id}"
-        async with self._session.get(url) as resp:
-            resp.raise_for_status()
-            content = await resp.json()
+        content = await self._get_with_retry(url)
         return self._wrap_post(content)
 
     async def get_blog_total_posts(self, author: str) -> int:
         url = f"{API_BASE}/v1/blog/{author}"
-        async with self._session.get(url) as resp:
-            resp.raise_for_status()
-            content = await resp.json()
+        content = await self._get_with_retry(url)
         count_obj = content.get("count", {})
         return count_obj.get("posts", 0)
 
@@ -449,9 +488,7 @@ class BoostyClient:
         if offset:
             params["offset"] = offset
         url = f"{API_BASE}/v1/blog/{author}/post/"
-        async with self._session.get(url, params=params) as resp:
-            resp.raise_for_status()
-            content = await resp.json()
+        content = await self._get_with_retry(url, params=params)
         extra = content["extra"]
         result = BoostyPostsListDto(
             extra=BoostyExtraDto(is_last=extra["isLast"], offset=extra.get("offset", "")),
@@ -487,11 +524,44 @@ class DownloadItem:
     media_type: str = "file"  # "photo" | "video" | "audio" | "file"
 
 
-def build_download_items(post: BoostyPostDto, post_path: Path) -> list[DownloadItem]:
+def build_download_items(post: BoostyPostDto, post_path: Path, is_flat: bool = False) -> list[DownloadItem]:
     items = []
     # Using enumerate with 1-based index and formatting with leading zeros (e.g. 001, 002)
     # assuming less than 1000 media items per post is common
+    
+    # Format date/time prefix for flat mode
+    flat_prefix = ""
+    if is_flat:
+        dt = datetime.fromtimestamp(post.publish_time, tz=timezone.utc)
+        flat_prefix = f"{dt.strftime('%Y-%m-%d')}_"
+        # Include title slug in prefix for better readability in flat mode
+        title_slug = validate_windows_dir_name(post.title or "post")[:50]
+        flat_prefix += f"{title_slug}_"
+
     for index, m in enumerate(post.media, start=1):
+        if is_flat:
+            base_name = f"{flat_prefix}{index:03d}"
+            if isinstance(m, BoostyImageDto):
+                filename = f"{base_name}.jpg"
+                items.append(DownloadItem(url=m.url, path=post_path / filename, media_type="photo"))
+            elif isinstance(m, BoostyVideoDto):
+                for q in VIDEO_QUALITY_GRADE:
+                    info = m.player_urls.get(q)
+                    if info and info.url:
+                        path = post_path / f"{base_name}.mp4"
+                        items.append(DownloadItem(url=info.url, path=path, fetch_size=True, media_type="video"))
+                        break
+            elif isinstance(m, BoostyAudioDto) and post.signed_query:
+                url = sign_url(m.url, post.signed_query)
+                path = post_path / f"{base_name}.mp3"
+                items.append(DownloadItem(url=url, path=path, media_type="audio"))
+            elif isinstance(m, BoostyFileDto) and post.signed_query:
+                url = sign_url(m.url, post.signed_query)
+                ext = Path(m.title).suffix if m.title else ""
+                path = post_path / f"{base_name}{ext}"
+                items.append(DownloadItem(url=url, path=path, media_type="file"))
+            continue
+
         prefix = f"{index:03d}_"
         if isinstance(m, BoostyImageDto):
             items.append(DownloadItem(url=m.url, path=post_path / f"{prefix}{m.id}.jpg", media_type="photo"))
@@ -528,6 +598,7 @@ class DownloadContext:
     byte_pbar: Optional[tqdm_asyncio] = None
     stats: Optional["DownloadStats"] = None
     total_posts: int = 0
+    is_flat: bool = False
 
 
 @dataclass
@@ -624,8 +695,8 @@ async def download_file(
                         initial_size = 0
                         open_mode = "wb"
 
-                    if ctx.byte_pbar is not None and total_size_expected is not None and not size_added_to_total:
-                        ctx.byte_pbar.total = (ctx.byte_pbar.total or 0) + total_size_expected - ctx.byte_pbar.n  # adjusting total
+                    if ctx.byte_pbar is not None and resp.content_length is not None and not size_added_to_total:
+                        ctx.byte_pbar.total = (ctx.byte_pbar.total or 0) + resp.content_length
                         size_added_to_total = True
 
                     async with aiofiles.open(part_path, open_mode) as f:
@@ -671,6 +742,13 @@ async def download_file(
                         break  # Break out of the retry loop, no point hammering an expired URL
 
                 if attempt < MAX_RETRIES:
+                    # Check for 404 Not Found - don't retry as it's a permanent error for this URL
+                    is_404 = (getattr(e, 'status', None) == 404) or ("404" in err_str) or ("Not Found" in err_str)
+                    
+                    if is_404:
+                        logger.error("File not found (404) %s", item.url)
+                        break
+                        
                     logger.warning("Retry %d/%d for %s due to error: %s (Resuming from %s bytes)", 
                                    attempt, MAX_RETRIES, item.path.name, e, initial_size)
                     await asyncio.sleep(RETRY_DELAY)
@@ -715,14 +793,22 @@ async def process_post(
         if ctx.post_pbar is not None:
             ctx.post_pbar.update(1)
         return
-    post_dir = get_post_dir(ctx.author_dir, post)
-    post_dir.mkdir(parents=True, exist_ok=True)
+    if ctx.is_flat:
+        post_dir = ctx.author_dir
+        # For flat mode, prefix content.txt with post date and title
+        dt = datetime.fromtimestamp(post.publish_time, tz=timezone.utc)
+        title_slug = validate_windows_dir_name(post.title or "post")[:50]
+        content_filename = f"{dt.strftime('%Y-%m-%d')}_{title_slug}_{CONTENT_FILENAME}"
+        content_file = post_dir / content_filename
+    else:
+        post_dir = get_post_dir(ctx.author_dir, post)
+        post_dir.mkdir(parents=True, exist_ok=True)
+        content_file = post_dir / CONTENT_FILENAME
 
     if ctx.post_pbar is not None:
         ctx.post_pbar.set_description(f"Processing post {post_index}/{ctx.total_posts or '??'}")
 
     # Save text
-    content_file = post_dir / CONTENT_FILENAME
     if not content_file.exists() and post.text_content:
         try:
             text = _to_plain_text(post.text_content)
@@ -735,7 +821,7 @@ async def process_post(
         except Exception as e:
             logger.error("Failed to save post text for %s: %s", post.id, e)
 
-    items = build_download_items(post, post_dir)
+    items = build_download_items(post, post_dir, is_flat=ctx.is_flat)
     if not items:
         if ctx.post_pbar is not None:
             ctx.post_pbar.update(1)
@@ -762,6 +848,7 @@ async def run(
     token: Optional[AuthToken],
     download_dir: Path,
     cancel_event: asyncio.Event,
+    is_flat: bool = False,
 ) -> DownloadStats:
     author_dir = download_dir / validate_windows_dir_name(author)
     author_dir.mkdir(parents=True, exist_ok=True)
@@ -782,7 +869,7 @@ async def run(
             # CDN session for external links (MUST have Referer - tests show okcdn requires it or fails with 400)
             async with aiohttp.ClientSession(
                 timeout=timeout,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+                headers=client._base_headers
             ) as cdn_session:
 
                 ctx = DownloadContext(
@@ -795,7 +882,8 @@ async def run(
                     post_pbar=post_pbar,
                     byte_pbar=byte_pbar,
                     stats=stats,
-                    total_posts=total_posts
+                    total_posts=total_posts,
+                    is_flat=is_flat
                 )
 
                 async for page in client.fetch_posts_lazy(author):
@@ -862,11 +950,16 @@ def main() -> None:
         default=None,
         help="Папка для загрузок. По умолчанию — рядом со скриптом.",
     )
+    parser.add_argument(
+        "-f", "--flat",
+        action="store_true",
+        help="Загружать все файлы в одну папку (без подпапок для каждого поста).",
+    )
     args = parser.parse_args()
 
-    author = (args.author or "").strip().replace("/", "").strip()
+    author = extract_nickname(args.author or "")
     if not author:
-        author = input("Author nickname (boosty.to/...): ").strip().replace("/", "").strip()
+        author = extract_nickname(input("Author nickname (boosty.to/...): "))
     if not author:
         print("No author given.")
         sys.exit(1)
@@ -892,7 +985,7 @@ def main() -> None:
         nonlocal stats_result
         try:
             stats = loop.run_until_complete(
-                run(author, token, download_dir, cancel_event)
+                run(author, token, download_dir, cancel_event, is_flat=args.flat)
             )
             stats_result.append(stats)
         finally:
