@@ -655,7 +655,8 @@ def make_tasks(post: Post, dest_dir: Path, is_flat: bool) -> list[DownloadTask]:
             if not url:
                 log.warning("Нет доступных URL для видео %s в посте %s", m.id, post.id)
                 continue
-            title = safe_filename(Path(m.title or m.id).stem)[:100]
+            clean_title = safe_filename(m.title or m.id)
+            title = Path(clean_title).stem[:100]
             fname = f"{pfx}.mp4" if is_flat else f"{pfx}_{title}.mp4"
             tasks.append(DownloadTask(
                 url=url, dest=dest_dir / fname,
@@ -668,13 +669,15 @@ def make_tasks(post: Post, dest_dir: Path, is_flat: bool) -> list[DownloadTask]:
                 continue
             url   = sign_url(m.url, post.signed_query)
             
+            clean_title = safe_filename(m.title or m.id)
+            
             if isinstance(m, Audio):
-                title = safe_filename(Path(m.title or m.id).stem)[:100]
+                title = Path(clean_title).stem[:100]
                 fname = f"{pfx}.mp3" if is_flat else f"{pfx}_{title}.mp3"
                 tasks.append(DownloadTask(url=url, dest=dest_dir / fname, media_type="audio", referer=None))
             else:
-                ext   = Path(m.title).suffix if m.title else ""
-                title = safe_filename(Path(m.title or m.id).stem)[:100]
+                ext   = Path(clean_title).suffix
+                title = Path(clean_title).stem[:100]
                 fname = f"{pfx}{ext}" if is_flat else f"{pfx}_{title}{ext}"
                 tasks.append(DownloadTask(url=url, dest=dest_dir / fname, media_type="file", referer=None))
 
