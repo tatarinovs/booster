@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -129,12 +130,62 @@ def save_token(token: AuthToken) -> None:
     log.info("Токен сохранён: %s", path)
 
 
+# JS-скрипт для получения токена из браузера (boosty.to → F12 → Console)
+_AUTH_JS = ("(function(){function getDecodedCookie(cookieName){const cookies=document.cookie.split(';')"
+            ",r={'%22':'\"','%3A':':','%2C':',','%7B':'{','%7D':'}'};for(let c of cookies){"
+            "const [n,v]=c.trim().split('=');if(n===cookieName&&v){let d=v;"
+            "Object.entries(r).forEach(([e,dec])=>d=d.replaceAll(e,dec));return d}}return null}"
+            "if(window.location.hostname==='boosty.to'){const authCookie=getDecodedCookie(\"auth\");"
+            "if(authCookie){const authObj=JSON.parse(authCookie),token={authorization:authObj.accessToken,"
+            "expires_in:authObj.expiresAt,full_cookie:document.cookie};"
+            "console.log(\"\\nJust copy this text:\\n\\n\"+btoa(JSON.stringify(token))+\"\\n\")}"
+            "else console.warn(\"Authorization data could not be found. Are you sure you are logged in?\")}"
+            "else console.warn(\"There is\",window.location.hostname,\", not boosty.to =)\")})();")
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Копирует текст в системный буфер обмена. Возвращает True при успехе."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run("clip", input=text.encode("utf-16-le"), check=True, capture_output=True)
+        elif sys.platform == "darwin":
+            subprocess.run("pbcopy", input=text.encode("utf-8"), check=True, capture_output=True)
+        else:
+            # Linux: пробуем xclip, потом xsel
+            for cmd in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+                try:
+                    subprocess.run(cmd, input=text.encode("utf-8"), check=True, capture_output=True)
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def prompt_token() -> Optional[AuthToken]:
-    print(
-        "\nДля получения токена: войдите на boosty.to, откройте F12 → Console,\n"
-        "выполните скрипт авторизации (см. README), вставьте результат сюда."
-    )
-    raw = input("Токен (Enter — пропустить): ").strip()
+    copied = _copy_to_clipboard(_AUTH_JS)
+    if copied:
+        print(
+            "\nДля получения токена:\n"
+            "  1. Откройте boosty.to в браузере и войдите в аккаунт.\n"
+            "  2. Нажмите F12 → вкладка Console.\n"
+            "  3. Скрипт уже скопирован в буфер обмена — вставьте его (Ctrl+V) и нажмите Enter.\n"
+            "     Если браузер просит разрешение — введите 'allow pasting' и повторите.\n"
+            "  4. Скопируйте строку base64 из консоли и вставьте ниже."
+        )
+    else:
+        print(
+            "\nДля получения токена: войдите на boosty.to, откройте F12 → Console,\n"
+            "выполните скрипт авторизации (см. README), вставьте результат сюда."
+        )
+    try:
+        raw = input("Токен (Enter — пропустить): ").strip()
+    except EOFError:
+        log.warning("Stdin недоступен, пропускаем ввод токена.")
+        return None
     if not raw:
         return None
     token = AuthToken.decode(raw)
@@ -793,7 +844,10 @@ def main() -> None:
 
     author = extract_nickname(args.author or "")
     if not author:
-        author = extract_nickname(input("Ник автора (boosty.to/...): "))
+        try:
+            author = extract_nickname(input("Ник автора (boosty.to/...): "))
+        except EOFError:
+            author = ""
     if not author:
         print("Ник автора не указан.")
         sys.exit(1)
