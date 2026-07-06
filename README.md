@@ -1,92 +1,70 @@
-# Booster — загрузка медиа с boosty.to
+# Booster CLI
 
-CLI-скрипт для скачивания медиа (фото, видео в максимальном качестве) и текста постов с boosty.to. Поддерживает авторизацию, повторный запуск с докачкой и запись неудачных загрузок в файл.
+Многопоточный консольный загрузчик контента с Boosty.to.
+Проект написан на **Go** (Golang) для максимальной производительности, низкого потребления памяти и работы без сторонних зависимостей.
 
-## Установка
+## Особенности
+- Авторизация через токен из консоли браузера.
+- Постраничный обход постов с инкрементальной синхронизацией (быстрая докачка новых постов за 1 секунду).
+- Пул из 5 воркеров с умным пулом буферов (экономное расходование RAM).
+- Докачка оборванных файлов (`.part` + `Range`), 5 повторных попыток на файл.
+- Graceful shutdown по `Ctrl+C` (сохраняет состояние для продолжения при следующем запуске).
 
-Требуется Python 3.10+.
+## Сборка
 
+В проекте есть готовые скрипты:
+- `build-win.bat` — собирает `booster.exe` (встраивает иконку и сжимает через UPX).
+- `build-linux.bat` — кросс-компиляция `booster_linux` под Linux (amd64).
+
+Или вручную:
 ```bash
-git clone https://github.com/tatarinovs/booster.git
-cd booster
-pip install -e .
-# или
-uv sync
+go build -trimpath -ldflags="-s -w" -o booster.exe .
 ```
 
 ## Запуск
 
 ```bash
-python booster.py
-# или
-uv run booster.py
+./boosty -a nickname            # или -a https://boosty.to/nickname
+./boosty -a nickname -o /path/to/downloads
+./boosty -a nickname -f         # плоский режим — все файлы в одну папку
 ```
 
-При запуске скрипт запросит **ник автора** (часть URL после `boosty.to/`, без слэшей). Рядом со скриптом будет создана папка с именем этого ника, в неё скачаются все посты и медиа.
+Если ник не передан флагом — программа спросит его в интерактивном режиме.
 
-**Опции командной строки:**
-
-- `-a`, `--author` — ник автора (если не указан, запрашивается в консоли).
-- `-o`, `--output` — папка для загрузок (по умолчанию — каталог со скриптом).
-
-Пример: `python booster.py -a myauthor -o C:\Downloads`.
-
-По окончании выводится краткая статистика (загружено/пропущено фото и видео, ошибки), затем окно остаётся открытым до нажатия Enter. При прерывании (Ctrl+C) текущие загрузки завершаются, после чего можно выйти.
+### Повторный запуск (докачка и обновление)
+Программа идеально подходит для регулярной синхронизации (например, через планировщик):
+- **Умный пропуск:** Полностью скачанные файлы автоматически пропускаются без лишних сетевых запросов.
+- **Докачка (Resume):** Если скачивание прервалось (закрытие программы, обрыв сети), незавершенные файлы (`.part`) будут докачаны с места обрыва.
+- **Синхронизация:** При новых запусках скачиваются только новые посты и медиафайлы, опубликованные с момента последней проверки.
 
 ## Авторизация
 
-Для доступа к платному и закрытому контенту нужен токен.
+Токен ищется в переменной окружения `BOOSTY_TOKEN`,
+затем в файле `.boosty_token` рядом с бинарником, затем в `~/.boosty_token`.
+Если токена нет или он просрочен — программа пытается скопировать в буфер
+обмена JS-скрипт для получения токена из консоли браузера и просит вставить 
+результат.
 
-### Как получить токен
+### Ручное получение токена
+Если скрипт автоматически не скопировался в буфер обмена:
+1. Зайдите на сайт `boosty.to` под своим аккаунтом.
+2. Откройте панель разработчика (обычно `F12` или `Ctrl+Shift+I`) и перейдите на вкладку **Console** (Консоль).
+3. Скопируйте и вставьте следующий JS-код, затем нажмите Enter:
+   ```javascript
+   (function(){function getDecodedCookie(cookieName){const cookies=document.cookie.split(';');r={'%22':'"','%3A':':','%2C':',','%7B':'{','%7D':'}'};for(let c of cookies){const [n,v]=c.trim().split('=');if(n===cookieName&&v){let d=v;Object.entries(r).forEach(([e,dec])=>d=d.replaceAll(e,dec));return d}}return null}if(window.location.hostname==='boosty.to'){const authCookie=getDecodedCookie("auth");if(authCookie){const authObj=JSON.parse(authCookie),token={authorization:authObj.accessToken,expires_in:authObj.expiresAt,full_cookie:document.cookie};console.log("\nJust copy this text:\n\n"+btoa(JSON.stringify(token))+"\n")}else console.warn("Authorization data could not be found. Are you sure you are logged in?")}else console.warn("There is",window.location.hostname,", not boosty.to =)")})();
+   ```
+4. Скопируйте появившуюся строку (выглядит как длинная base64 последовательность) и вставьте её в программу.
 
-1. Откройте [boosty.to](https://boosty.to) в браузере и войдите в аккаунт.
-2. Нажмите F12 → вкладка **Console**.
-3. Вставьте в консоль и выполните (Enter) скрипт ниже — в консоли появится строка в base64, скопируйте её целиком.
-4. При первом запуске `booster.py` вставьте эту строку, когда скрипт попросит токен; он сохранится в файл `.boosty_token` в папке со скриптом.
+## Структура
 
-Если браузер предупреждает о вставке кода — введите в консоли `allow pasting` и нажмите Enter, затем снова вставьте скрипт.
-
-**Скрипт для консоли браузера (скопируйте целиком):**
-
-```javascript
-(function(){function getDecodedCookie(cookieName){const cookies=document.cookie.split(';'),r={'%22':'"','%3A':':','%2C':',','%7B':'{','%7D':'}'};for(let c of cookies){const [n,v]=c.trim().split('=');if(n===cookieName&&v){let d=v;Object.entries(r).forEach(([e,dec])=>d=d.replaceAll(e,dec));return d}}return null}if(window.location.hostname==='boosty.to'){const authCookie=getDecodedCookie("auth");if(authCookie){const authObj=JSON.parse(authCookie),token={authorization:authObj.accessToken,expires_in:authObj.expiresAt,full_cookie:document.cookie};console.log("\nJust copy this text:\n\n"+btoa(JSON.stringify(token))+"\n")}else console.warn("Authorization data could not be found. Are you sure you are logged in?")}else console.warn("There is",window.location.hostname,", not boosty.to =)")})();
-```
-
-Скрипт взят из репозитория [boosty_downloader](https://github.com/lowfc/boosty_downloader) (файл `src/js/auth_getter.js`).
-
-### Где хранится токен
-
-- Переменная окружения `BOOSTY_TOKEN` (приоритет).
-- Файл `.boosty_token` в каталоге скрипта или в домашней директории пользователя.
-
-Токен имеет срок действия; при истечении скрипт предложит ввести новый.
-
-## Структура папок
-
-```
-{папка_скрипта}/
-  .boosty_token          # сохранённый токен (опционально)
-  booster.py
-  {ник_автора}/           # папка автора
-    failed.txt            # список неудачных загрузок (путь + URL)
-    {заголовок_поста}_{id}/   # один пост
-      content.txt         # текст поста
-      *.jpg               # фото
-      *.mp4               # видео и т.д.
-```
-
-- Каждый пост лежит в папке вида `{заголовок}_{id}` (безопасное имя для Windows).
-- Текст поста сохраняется в `content.txt`.
-- Фото и видео качаются в максимальном доступном качестве.
-
-## Повторный запуск
-
-При повторном запуске для того же автора скрипт не перезаписывает уже скачанные файлы: проверяется наличие файла по пути, при наличии — загрузка пропускается. Таким образом можно докачивать только новые посты и недостающие файлы.
-
-## Ошибки загрузки
-
-Если загрузка одного из файлов не удалась (сеть, ошибка API и т.п.), скрипт записывает строку в `{ник_автора}/failed.txt` в формате:
-
-```
-{путь_к_файлу}\t{URL}
-```
+- `main.go` — CLI, сигналы, точка входа
+- `auth.go` — токен: decode/encode, load/save, буфер обмена
+- `client.go` — HTTP-клиент API boosty.to, пагинация, парсинг постов/медиа
+- `models.go` — модели данных (Post, MediaItem)
+- `text.go` — рендер текстовых блоков поста в plain text
+- `tasks.go` — построение задач загрузки из поста
+- `download.go` — воркеры, докачка, retry
+- `stats.go` — статистика загрузки
+- `progress.go` / `log.go` — однострочный индикатор прогресса и логирование
+- `run.go` — основной цикл (аналог `run()` в Python)
+- `util.go` — safeFilename, signURL, extractNickname, safeUnlink/Replace
