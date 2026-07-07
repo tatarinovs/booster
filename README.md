@@ -22,18 +22,17 @@
 ## Сборка
 
 В проекте есть готовые скрипты:
-- `build-win.bat` — собирает `booster.exe` (встраивает иконку и сжимает через UPX).
-- `build-linux.bat` — кросс-компиляция `booster-linux-amd64` под Linux (amd64).
-- `build-macos.bat` — кросс-компиляция под macOS: `booster-macos-amd64` (Intel) и `booster-macos-arm64` (Apple Silicon).
+- `build-win.bat` — быстрая сборка `booster.exe`.
+- `build-releases.bat` — массовая сборка релизов под все платформы (Windows, Linux, macOS) и архитектуры (amd64, arm64, x86). Все готовые бинарники складываются в отдельную папку `builds/`.
 
 Или вручную:
 ```bash
-go build -trimpath -ldflags="-s -w" -o booster.exe .
+go build -trimpath -ldflags="-s -w -buildid=" -o booster.exe ./cmd/booster
 ```
 
 ## Запуск
 
-Имя исполняемого файла зависит от вашей ОС и того, какой релиз вы скачали. В примерах ниже используется `./booster` (для Windows это будет `booster.exe`).
+Имя исполняемого файла зависит от вашей ОС и того, какой релиз вы скачали. В примерах ниже используется `./booster`.
 
 ```bash
 # Базовый запуск (программа спросит ник в интерактивном режиме)
