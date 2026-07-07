@@ -9,7 +9,7 @@ import (
 
 const (
 	failedFilename  = "failed.txt"
-	contentFilename = "content.txt"
+	contentFilename = "content.md"
 )
 
 // DownloadTask описывает одну задачу скачивания файла.
@@ -52,6 +52,14 @@ func orDefault(s, def string) string {
 	return s
 }
 
+// stripKnownExt обрезает расширение из имени файла, если оно совпадает.
+func stripKnownExt(name, ext string) string {
+	if strings.HasSuffix(strings.ToLower(name), ext) {
+		return name[:len(name)-len(ext)]
+	}
+	return name
+}
+
 // makeTasks строит список задач загрузки для поста.
 func makeTasks(post *Post, destDir string, isFlat bool) []DownloadTask {
 	var tasks []DownloadTask
@@ -84,11 +92,7 @@ func makeTasks(post *Post, destDir string, isFlat bool) []DownloadTask {
 				logWarn("Нет доступных URL для видео %s в посте %s", m.ID, post.ID)
 				continue
 			}
-			cleanTitle := safeFilename(orDefault(m.Title, m.ID))
-			if strings.HasSuffix(strings.ToLower(cleanTitle), ".mp4") {
-				cleanTitle = cleanTitle[:len(cleanTitle)-4]
-			}
-			title := truncateRunes(cleanTitle, 100)
+			title := truncateRunes(safeFilename(stripKnownExt(orDefault(m.Title, m.ID), ".mp4")), 100)
 			var fname string
 			if isFlat {
 				fname = pfx + ".mp4"
@@ -106,15 +110,10 @@ func makeTasks(post *Post, destDir string, isFlat bool) []DownloadTask {
 				continue
 			}
 			url := signURL(m.URL, post.SignedQuery)
-			cleanTitle := safeFilename(orDefault(m.Title, m.ID))
+			rawTitle := safeFilename(orDefault(m.Title, m.ID))
 
 			if m.Kind == MediaAudio {
-				title := cleanTitle
-				if strings.HasSuffix(strings.ToLower(cleanTitle), ".mp3") {
-					title = truncateRunes(cleanTitle[:len(cleanTitle)-4], 100)
-				} else {
-					title = truncateRunes(cleanTitle, 100)
-				}
+				title := truncateRunes(stripKnownExt(rawTitle, ".mp3"), 100)
 				var fname string
 				if isFlat {
 					fname = pfx + ".mp3"
@@ -125,8 +124,8 @@ func makeTasks(post *Post, destDir string, isFlat bool) []DownloadTask {
 					URL: url, Dest: filepath.Join(destDir, fname), MediaType: "audio",
 				})
 			} else {
-				ext := filepath.Ext(cleanTitle)
-				stem := truncateRunes(strings.TrimSuffix(cleanTitle, ext), 100)
+				ext := filepath.Ext(rawTitle)
+				stem := truncateRunes(strings.TrimSuffix(rawTitle, ext), 100)
 				var fname string
 				if isFlat {
 					fname = pfx + ext

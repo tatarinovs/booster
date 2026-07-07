@@ -30,7 +30,7 @@ func newDownloadHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	return &http.Client{
-		Timeout:   0, // без общего таймаута — файлы могут быть большими (аналог total=None)
+		Timeout:   0, // без общего таймаута — файлы могут быть большими
 		Transport: transport,
 	}
 }
@@ -38,6 +38,14 @@ func newDownloadHTTPClient() *http.Client {
 func warnRetry(attempt int, name string, err error) {
 	if attempt < maxDownloadRetries {
 		logWarn("Попытка %d/%d для %s: %v", attempt, maxDownloadRetries, name, err)
+	}
+}
+
+// retryDelay логирует предупреждение и засыпает перед следующей попыткой.
+func retryDelay(attempt int, name string, err error) {
+	warnRetry(attempt, name, err)
+	if attempt < maxDownloadRetries {
+		time.Sleep(downloadRetryDelay)
 	}
 }
 
@@ -52,7 +60,6 @@ func appendFailed(failedPath, dest, url string) {
 }
 
 // downloadWorker забирает задачи из канала и скачивает их последовательно.
-// Канал закрывается продюсером по завершении обхода постов.
 func downloadWorker(id int, tasks <-chan DownloadTask, client *BoostyClient, dlClient *http.Client,
 	stats *Stats, cancelFlag *atomic.Bool, abortFlag *atomic.Bool, failedPath string, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -88,9 +95,10 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 	}
 
 	part := task.Dest + ".part"
-	var initial int64
+	// partSize — текущий размер .part файла (используется как offset для Range и счётчик).
+	var partSize int64
 	if fi, err := os.Stat(part); err == nil {
-		initial = fi.Size()
+		partSize = fi.Size()
 	}
 
 	parsedURL, _ := url.Parse(task.URL)
@@ -110,17 +118,14 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 
 		req, err := http.NewRequest(http.MethodGet, task.URL, nil)
 		if err != nil {
-			warnRetry(attempt, filepath.Base(task.Dest), err)
-			if attempt < maxDownloadRetries {
-				time.Sleep(downloadRetryDelay)
-			}
+			retryDelay(attempt, filepath.Base(task.Dest), err)
 			continue
 		}
 		for k, v := range baseHeaders {
 			req.Header.Set(k, v)
 		}
-		if initial > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", initial))
+		if partSize > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", partSize))
 		}
 		if task.Referer != "" {
 			req.Header.Set("Referer", task.Referer)
@@ -128,19 +133,16 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 
 		resp, err := dlClient.Do(req)
 		if err != nil {
-			warnRetry(attempt, filepath.Base(task.Dest), err)
-			if attempt < maxDownloadRetries {
-				time.Sleep(downloadRetryDelay)
-			}
+			retryDelay(attempt, filepath.Base(task.Dest), err)
 			continue
 		}
 
 		if resp.StatusCode == 400 || resp.StatusCode == 403 {
 			resp.Body.Close()
-			if initial > 0 && !deletedPart {
+			if partSize > 0 && !deletedPart {
 				logInfo("CDN отклонил Range для %s, качаем заново", filepath.Base(task.Dest))
 				_ = safeUnlink(part)
-				initial = 0
+				partSize = 0
 				deletedPart = true
 				continue // сразу повторяем без sleep
 			}
@@ -154,10 +156,7 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 		}
 		if resp.StatusCode >= 400 {
 			resp.Body.Close()
-			warnRetry(attempt, filepath.Base(task.Dest), fmt.Errorf("HTTP %d", resp.StatusCode))
-			if attempt < maxDownloadRetries {
-				time.Sleep(downloadRetryDelay)
-			}
+			retryDelay(attempt, filepath.Base(task.Dest), fmt.Errorf("HTTP %d", resp.StatusCode))
 			continue
 		}
 
@@ -165,24 +164,21 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 		var flags int
 		if resp.StatusCode == 206 {
 			if resp.ContentLength > 0 {
-				expected = initial + resp.ContentLength
+				expected = partSize + resp.ContentLength
 			}
 			flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
 		} else {
 			if task.IsVideo {
 				expected = resp.ContentLength
 			}
-			initial = 0
+			partSize = 0
 			flags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 		}
 
 		f, ferr := os.OpenFile(part, flags, 0o644)
 		if ferr != nil {
 			resp.Body.Close()
-			warnRetry(attempt, filepath.Base(task.Dest), ferr)
-			if attempt < maxDownloadRetries {
-				time.Sleep(downloadRetryDelay)
-			}
+			retryDelay(attempt, filepath.Base(task.Dest), ferr)
 			continue
 		}
 
@@ -201,7 +197,7 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 					writeErr = werr
 					break
 				}
-				initial += int64(n)
+				partSize += int64(n)
 				stats.addBytes(int64(n))
 			}
 			if rerr == io.EOF {
@@ -221,19 +217,13 @@ func downloadOne(task DownloadTask, client *BoostyClient, dlClient *http.Client,
 		}
 
 		if writeErr != nil {
-			warnRetry(attempt, filepath.Base(task.Dest), writeErr)
-			if attempt < maxDownloadRetries {
-				time.Sleep(downloadRetryDelay)
-			}
+			retryDelay(attempt, filepath.Base(task.Dest), writeErr)
 			continue
 		}
 
-		if task.IsVideo && expected > 0 && initial < expected {
-			warnRetry(attempt, filepath.Base(task.Dest),
-				fmt.Errorf("неполный файл: ожидалось %d байт, получено %d", expected, initial))
-			if attempt < maxDownloadRetries {
-				time.Sleep(downloadRetryDelay)
-			}
+		if task.IsVideo && expected > 0 && partSize < expected {
+			retryDelay(attempt, filepath.Base(task.Dest),
+				fmt.Errorf("неполный файл: ожидалось %d байт, получено %d", expected, partSize))
 			continue
 		}
 

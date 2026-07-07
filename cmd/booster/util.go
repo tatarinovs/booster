@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var illegalCharsRe = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
@@ -32,8 +33,10 @@ func safeFilename(name string) string {
 	if reservedNames[strings.ToUpper(stem)] {
 		clean = "_" + clean + "_"
 	}
-	if len(clean) > 255 {
-		clean = clean[:255]
+	// Ограничение — 255 символов (рун), а не байт: кириллица занимает 2 байта на символ.
+	if utf8.RuneCountInString(clean) > 255 {
+		runes := []rune(clean)
+		clean = string(runes[:255])
 	}
 	if clean == "" {
 		clean = "unnamed"
@@ -73,36 +76,51 @@ func extractNickname(s string) string {
 	return strings.TrimSpace(strings.ReplaceAll(s, "/", ""))
 }
 
-// safeUnlink удаляет файл с повторными попытками (Windows держит файлы открытыми).
-func safeUnlink(path string) error {
+// windowsRetry повторяет операцию до 5 раз с паузой.
+// На не-Windows платформах — один вызов без повторов.
+func windowsRetry(fn func() error) error {
 	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		err := os.Remove(path)
+	for i := 0; i < 5; i++ {
+		err := fn()
 		if err == nil || os.IsNotExist(err) {
 			return nil
 		}
 		lastErr = err
 		if runtime.GOOS != "windows" {
-			return err
+			return lastErr
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	return lastErr
 }
 
+// safeUnlink удаляет файл с повторными попытками (Windows держит файлы открытыми).
+func safeUnlink(path string) error {
+	return windowsRetry(func() error { return os.Remove(path) })
+}
+
 // safeReplace атомарно переименовывает файл с повторными попытками.
 func safeReplace(src, dst string) error {
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		err := os.Rename(src, dst)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if runtime.GOOS != "windows" {
-			return err
-		}
-		time.Sleep(500 * time.Millisecond)
+	return windowsRetry(func() error { return os.Rename(src, dst) })
+}
+
+// asString безопасно извлекает string из any.
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+// asMapSlice безопасно приводит []any к []map[string]any.
+func asMapSlice(v any) []map[string]any {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
 	}
-	return lastErr
+	out := make([]map[string]any, 0, len(arr))
+	for _, e := range arr {
+		if m, ok := e.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
 }

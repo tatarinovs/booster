@@ -87,7 +87,7 @@ func (c *BoostyClient) get(ctx context.Context, rawURL string, params url.Values
 
 		if resp.StatusCode >= 400 {
 			herr := &httpError{status: resp.StatusCode, url: rawURL}
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			if resp.StatusCode < 500 {
 				logError("API %s → %v", rawURL, herr)
 				return nil, herr
 			}
@@ -122,11 +122,7 @@ func (c *BoostyClient) get(ctx context.Context, rawURL string, params url.Values
 }
 
 func backoffDelay(attempt int) time.Duration {
-	d := apiRetryBaseDelay
-	for i := 1; i < attempt; i++ {
-		d *= 2
-	}
-	return d
+	return apiRetryBaseDelay << uint(attempt-1)
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

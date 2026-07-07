@@ -4,13 +4,13 @@
       "Major": 1,
       "Minor": 0,
       "Patch": 0,
-      "Build": 1
+      "Build": 0
     },
     "ProductVersion": {
       "Major": 1,
       "Minor": 0,
       "Patch": 0,
-      "Build": 1
+      "Build": 0
     },
     "FileFlagsMask": "3f",
     "FileFlags ": "00",
@@ -22,14 +22,14 @@
     "Comments": "",
     "CompanyName": "Billy_Bones",
     "FileDescription": "Booster — загрузчик медиа с boosty.to",
-    "FileVersion": "1.0.0.1",
+    "FileVersion": "1.0.0.0",
     "InternalName": "booster",
     "LegalCopyright": "© 2026 Billy_Bones",
     "LegalTrademarks": "",
     "OriginalFilename": "booster.exe",
     "PrivateBuild": "",
     "ProductName": "Booster",
-    "ProductVersion": "1.0.0.1",
+    "ProductVersion": "1.0.0.0",
     "SpecialBuild": ""
   },
   "VarFileInfo": {

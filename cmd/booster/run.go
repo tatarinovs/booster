@@ -117,16 +117,16 @@ postsLoop:
 				}
 			}
 
-			if text := postToText(post.TextBlocks); text != "" {
-				var tf string
-				if opts.isFlat {
-					date := postDate(&post)
-					slug := truncateRunes(safeFilename(orDefault(post.Title, "post")), 50)
-					tf = filepath.Join(postDir, fmt.Sprintf("%s_%s_%s", date, slug, contentFilename))
-				} else {
-					tf = filepath.Join(postDir, contentFilename)
-				}
-				if _, err := os.Stat(tf); os.IsNotExist(err) {
+			var tf string
+			if opts.isFlat {
+				date := postDate(&post)
+				slug := truncateRunes(safeFilename(orDefault(post.Title, "post")), 50)
+				tf = filepath.Join(postDir, fmt.Sprintf("%s_%s_%s", date, slug, contentFilename))
+			} else {
+				tf = filepath.Join(postDir, contentFilename)
+			}
+			if _, err := os.Stat(tf); os.IsNotExist(err) {
+				if text := postToMarkdown(post.TextBlocks); text != "" {
 					pubDate := time.Unix(post.PublishTime, 0).UTC().Format("02.01.2006 15:04 UTC")
 					fullText := fmt.Sprintf("Published %s\n\n%s", pubDate, text)
 					if werr := os.WriteFile(tf, []byte(fullText), 0o644); werr != nil {
