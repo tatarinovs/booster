@@ -5,8 +5,10 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
+
+// maxWorkerLines ограничивает число строк воркеров в индикаторе прогресса.
+const maxWorkerLines = 10
 
 // progressState хранит данные для индикатора прогресса.
 type progressState struct {
@@ -14,19 +16,19 @@ type progressState struct {
 	donePosts        int
 	stats            *Stats
 	workers          map[int]string // id воркера → текущий файл
-	startTime        time.Time
+	workerCount      int
 	lastPrintedLines int
 	finished         bool
 }
 
 var progress = &progressState{workers: map[int]string{}}
 
-func progressInit(total int, stats *Stats) {
+func progressInit(total int, stats *Stats, workers int) {
 	logMu.Lock()
 	defer logMu.Unlock()
 	progress.totalPosts = total
 	progress.stats = stats
-	progress.startTime = time.Now()
+	progress.workerCount = workers
 	progress.lastPrintedLines = 0
 	progress.finished = false
 }
@@ -58,6 +60,9 @@ func progressWorkerSet(id int, name string) {
 
 // progressClearLocked стирает текущий прогресс-бар с экрана, чтобы лог не перекрывался.
 func progressClearLocked() {
+	if !ansiEnabled {
+		return
+	}
 	if progress.lastPrintedLines > 0 {
 		// Поднимаемся на lastPrintedLines вверх и стираем всё до конца экрана
 		fmt.Fprintf(os.Stderr, "\r\033[%dA\033[J", progress.lastPrintedLines)
@@ -76,7 +81,9 @@ func progressRepaint() {
 
 // progressRepaintLocked перерисовывает строку прогресса; вызывающий уже держит logMu.
 func progressRepaintLocked() {
-	if progress.finished {
+	// Без консоли перерисовывать нечего: escape-последовательности в файле
+	// только мешают, а сам ход работы виден по строкам лога.
+	if !ansiEnabled || progress.finished {
 		return
 	}
 	if progress.totalPosts == 0 && progress.donePosts == 0 {
@@ -117,10 +124,14 @@ func progressRepaintLocked() {
 		bar, progress.donePosts, progress.totalPosts, pct, totalFmt, speedFmt)
 	lines = append(lines, main)
 
-	// 2. Воркеры
+	// 2. Воркеры. При большом -workers список не должен занимать весь экран,
+	// поэтому показываем только первые maxWorkerLines строк.
 	termW := terminalWidth()
-	// Используем константу workersCount из download.go (равна 5)
-	for i := 0; i < workersCount; i++ {
+	shown := progress.workerCount
+	if shown > maxWorkerLines {
+		shown = maxWorkerLines
+	}
+	for i := 0; i < shown; i++ {
 		name := progress.workers[i]
 		if name == "" {
 			lines = append(lines, fmt.Sprintf("  w%d: [ожидание...]", i))
@@ -132,6 +143,15 @@ func progressRepaintLocked() {
 			}
 			lines = append(lines, prefix+truncateForDisplay(name, maxName))
 		}
+	}
+	if rest := progress.workerCount - shown; rest > 0 {
+		active := 0
+		for id := range progress.workers {
+			if id >= shown {
+				active++
+			}
+		}
+		lines = append(lines, fmt.Sprintf("  … ещё %d воркеров, активных: %d", rest, active))
 	}
 
 	// Возвращаемся наверх
@@ -168,23 +188,14 @@ func truncateForDisplay(s string, n int) string {
 	return string(runes[:n-1]) + "…"
 }
 
-// displayWidth возвращает примерное количество колонок, занимаемых строкой.
-func displayWidth(s string) int {
-	w := 0
-	for _, r := range s {
-		if r >= 0x1100 && isCJKOrWide(r) {
-			w += 2
-		} else {
-			w++
-		}
-	}
-	return w
-}
-
 func isCJKOrWide(r rune) bool {
 	return (r >= 0x1100 && r <= 0x115F) || // Hangul Jamo
 		(r >= 0x2E80 && r <= 0x303E) || // CJK Radicals
-		(r >= 0x3040 && r <= 0x33BF) || // Japanese
+		(r >= 0x3040 && r <= 0x33BF) || // Кана и CJK-символы
+		(r >= 0x3400 && r <= 0x4DBF) || // CJK Extension A
+		(r >= 0x4E00 && r <= 0x9FFF) || // CJK Unified Ideographs — основной блок иероглифов
+		(r >= 0xA000 && r <= 0xA4CF) || // Yi
+		(r >= 0xAC00 && r <= 0xD7A3) || // Hangul Syllables
 		(r >= 0xF900 && r <= 0xFAFF) || // CJK Compatibility
 		(r >= 0xFE30 && r <= 0xFE6F) || // CJK Compatibility Forms
 		(r >= 0xFF01 && r <= 0xFF60) || // Fullwidth Forms
@@ -199,7 +210,6 @@ func fitToWidth(s string, maxW int) string {
 		return ""
 	}
 	w := 0
-	byteOff := 0
 	for i, r := range s {
 		rw := 1
 		if r >= 0x1100 && isCJKOrWide(r) {
@@ -209,9 +219,7 @@ func fitToWidth(s string, maxW int) string {
 			return s[:i]
 		}
 		w += rw
-		byteOff = i + utf8.RuneLen(r)
 	}
-	_ = byteOff
 	return s
 }
 
@@ -227,8 +235,6 @@ func formatBytes(n float64) string {
 	}
 	return fmt.Sprintf("%.1f%s", n, units[i])
 }
-
-
 
 // progressStartTicker периодически перерисовывает строку прогресса (для обновления скорости).
 func progressStartTicker(stop <-chan struct{}) {
@@ -252,7 +258,7 @@ func progressFinish() {
 		return
 	}
 	progress.finished = true
-	if progress.lastPrintedLines > 0 {
+	if ansiEnabled && progress.lastPrintedLines > 0 {
 		fmt.Fprintln(os.Stderr)
 		progress.lastPrintedLines = 0
 	}

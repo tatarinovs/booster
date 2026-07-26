@@ -22,6 +22,12 @@ var reservedNames = map[string]bool{
 }
 
 // safeFilename очищает строку для использования как имя файла/папки на Windows.
+//
+// Обход каталогов здесь невозможен: регулярка выше уже вырезала оба разделителя
+// пути, поэтому опасны только имена целиком из точек — их снимает Trim, а
+// финальная проверка страхует от «.» и «..». Внутренние многоточия в заголовках
+// намеренно сохраняются: имя файла должно быть стабильным между запусками,
+// иначе os.Stat не найдёт ранее скачанный файл и весь пост скачается заново.
 func safeFilename(name string) string {
 	clean := illegalCharsRe.ReplaceAllString(name, "_")
 	clean = strings.Trim(clean, " .")
@@ -36,12 +42,22 @@ func safeFilename(name string) string {
 	// Ограничение — 255 символов (рун), а не байт: кириллица занимает 2 байта на символ.
 	if utf8.RuneCountInString(clean) > 255 {
 		runes := []rune(clean)
-		clean = string(runes[:255])
+		// Обрезка могла оставить точку или пробел в конце, а Windows молча
+		// отбрасывает их при создании файла — имя перестало бы совпадать.
+		clean = strings.TrimRight(string(runes[:255]), " .")
 	}
-	if clean == "" {
+	if clean == "" || clean == "." || clean == ".." {
 		clean = "unnamed"
 	}
 	return clean
+}
+
+// isBoostyHost сообщает, принадлежит ли хост домену boosty.to.
+// Проверка идёт по суффиксу, а не по подстроке: «boosty.to.example.com» —
+// чужой хост, и отправлять туда Authorization с полной cookie нельзя.
+func isBoostyHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	return host == "boosty.to" || strings.HasSuffix(host, ".boosty.to")
 }
 
 // signURL добавляет параметры подписи в URL, не перезаписывая существующие.
@@ -108,6 +124,12 @@ func safeReplace(src, dst string) error {
 func asString(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// asFloat безопасно извлекает число из any (encoding/json отдаёт числа как float64).
+func asFloat(v any) (float64, bool) {
+	f, ok := v.(float64)
+	return f, ok
 }
 
 // asMapSlice безопасно приводит []any к []map[string]any.

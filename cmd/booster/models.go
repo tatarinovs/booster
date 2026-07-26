@@ -8,6 +8,9 @@ const (
 	MediaVideo
 	MediaAudio
 	MediaFile
+	// MediaExternal — видео с YouTube/Vimeo. Скачать его нельзя, но и молча
+	// терять нельзя: ссылки выгружаются отдельным файлом.
+	MediaExternal
 )
 
 // MediaItem — единое представление вложения поста (аналог MediaItem union в Python).
@@ -34,7 +37,6 @@ func (m *MediaItem) bestURL() string {
 // Post — распарсенный пост блога.
 type Post struct {
 	ID          string
-	IntID       int64
 	HasAccess   bool
 	PublishTime int64
 	Title       string

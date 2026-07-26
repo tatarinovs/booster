@@ -11,16 +11,19 @@ import (
 type Stats struct {
 	mu sync.Mutex
 
-	photos   int
-	videos   int
-	audio    int
-	files    int
-	skipped  int
-	errors   int
-	noAccess int
+	photos    int
+	videos    int
+	audio     int
+	files     int
+	gallery   int
+	galleries int
+	skipped   int
+	errors    int
+	noAccess  int
+	cancelled int
+	external  int
 
 	processedBytes atomic.Int64
-	lastPbarUpdate time.Time
 	startTime      time.Time
 }
 
@@ -42,6 +45,9 @@ func (s *Stats) record(mediaType string, skipped, errored bool) {
 		s.videos++
 	case mediaType == "audio":
 		s.audio++
+	case mediaType == "gallery":
+		// Сам архив в счётчике не нужен: фото считает addGalleryFiles
+		// по факту распаковки.
 	default:
 		s.files++
 	}
@@ -53,6 +59,41 @@ func (s *Stats) incNoAccess() {
 	s.mu.Unlock()
 }
 
+// incCancelled учитывает задачу, отброшенную при мягкой остановке.
+func (s *Stats) incCancelled() {
+	s.mu.Lock()
+	s.cancelled++
+	s.mu.Unlock()
+}
+
+// incExternal учитывает внешнее видео, ссылка на которое сохранена в файл.
+func (s *Stats) incExternal() {
+	s.mu.Lock()
+	s.external++
+	s.mu.Unlock()
+}
+
+// incGallery учитывает найденную внешнюю галерею.
+func (s *Stats) incGallery() {
+	s.mu.Lock()
+	s.galleries++
+	s.mu.Unlock()
+}
+
+// addGalleryFiles учитывает фото, извлечённые из архива галереи.
+func (s *Stats) addGalleryFiles(n int) {
+	s.mu.Lock()
+	s.gallery += n
+	s.mu.Unlock()
+}
+
+// errorCount возвращает число неудавшихся загрузок.
+func (s *Stats) errorCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.errors
+}
+
 func (s *Stats) addBytes(n int64) {
 	s.processedBytes.Add(n)
 }
@@ -60,7 +101,12 @@ func (s *Stats) addBytes(n int64) {
 func (s *Stats) total() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.photos + s.videos + s.audio + s.files
+	return s.totalLocked()
+}
+
+// totalLocked — то же самое для вызывающего, который уже держит s.mu.
+func (s *Stats) totalLocked() int {
+	return s.photos + s.videos + s.audio + s.files + s.gallery
 }
 
 func (s *Stats) snapshotBytes() (int64, time.Duration) {
@@ -86,10 +132,14 @@ func (s *Stats) printSummary() {
 		{"Видео:", s.videos},
 		{"Аудио:", s.audio},
 		{"Файлы:", s.files},
+		{"Фото из галерей:", s.gallery},
+		{"Галерей:", s.galleries},
 		{"Пропущено:", s.skipped},
 		{"Нет доступа:", s.noAccess},
+		{"Отменено:", s.cancelled},
+		{"Внешних видео:", s.external},
 		{"Ошибок:", s.errors},
-		{"Итого:", s.photos + s.videos + s.audio + s.files},
+		{"Итого:", s.totalLocked()},
 	}
 	for _, r := range rows {
 		if r.val != 0 || r.label == "Итого:" {

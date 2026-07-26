@@ -1,0 +1,40 @@
+# Токен авторизации — НИКОГДА не коммитить
+.boosty_token
+
+# Собранные бинарники
+*.exe
+booster-linux-amd64
+booster-linux-arm64
+booster-linux-386
+booster-macos-arm64
+booster-macos-amd64
+builds/
+
+# Сгенерированный Windows-ресурс (иконка + версия).
+# Создаётся командой: go generate ./cmd/booster
+resource.syso
+
+# Временные файлы докачки
+*.part
+
+# Служебные файлы синхронизации
+.syncing
+.latest_post
+failed.txt
+
+# Python-версия проекта и её артефакты
+booster-python/
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Локальные черновики
+bak/
+*.bak
+
+# Персональные .cmd-запускалки: содержат ники авторов, на которых подписан
+# пользователь. Скрипты сборки — .bat, под это правило не попадают.
+*.cmd

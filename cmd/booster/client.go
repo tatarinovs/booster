@@ -5,22 +5,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
+// apiBase — переменная, а не константа, чтобы тесты могли подставить httptest-сервер.
+var apiBase = "https://api.boosty.to"
+
 const (
-	apiBase           = "https://api.boosty.to"
 	postsPageLimit    = 20
 	apiMaxRetries     = 5
 	apiRetryBaseDelay = 2 * time.Second
 	apiTimeout        = 30 * time.Second
+	// retryAfterCap ограничивает Retry-After: сервер может попросить ждать час,
+	// но столько держать пользователя в неведении бессмысленно.
+	retryAfterCap = 60 * time.Second
 )
 
 // BoostyClient — HTTP-клиент для API boosty.to.
 type BoostyClient struct {
-	token   *AuthToken
 	headers map[string]string
 	http    *http.Client
 }
@@ -37,7 +44,6 @@ func newBoostyClient(token *AuthToken) *BoostyClient {
 		h["Cookie"] = token.Cookie
 	}
 	return &BoostyClient{
-		token:   token,
 		headers: h,
 		http:    &http.Client{Timeout: apiTimeout},
 	}
@@ -87,17 +93,34 @@ func (c *BoostyClient) get(ctx context.Context, rawURL string, params url.Values
 
 		if resp.StatusCode >= 400 {
 			herr := &httpError{status: resp.StatusCode, url: rawURL}
-			if resp.StatusCode < 500 {
+			retryAfter := resp.Header.Get("Retry-After")
+
+			if !isRetryableStatus(resp.StatusCode) {
+				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+					logError("API отклонил авторизацию (HTTP %d). Токен истёк или отозван — "+
+						"удалите файл %s и запустите программу заново, чтобы авторизоваться.",
+						resp.StatusCode, tokenFilename)
+				}
 				logError("API %s → %v", rawURL, herr)
 				return nil, herr
 			}
+
 			lastErr = herr
 			if attempt == apiMaxRetries {
 				logError("API %s — %d попыток исчерпано: %v", rawURL, attempt, herr)
 				return nil, herr
 			}
 			delay := backoffDelay(attempt)
-			logWarn("API %s — ошибка, повтор через %ds (%d/%d): %v", rawURL, int(delay.Seconds()), attempt, apiMaxRetries, herr)
+			// 429 — сервер сам говорит, сколько ждать; его указание приоритетнее.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				if d, ok := parseRetryAfter(retryAfter); ok {
+					delay = d
+				}
+				logWarn("API %s — лимит запросов (429), повтор через %ds (%d/%d)",
+					rawURL, int(delay.Seconds()), attempt, apiMaxRetries)
+			} else {
+				logWarn("API %s — ошибка, повтор через %ds (%d/%d): %v", rawURL, int(delay.Seconds()), attempt, apiMaxRetries, herr)
+			}
 			sleepCtx(ctx, delay)
 			continue
 		}
@@ -121,8 +144,40 @@ func (c *BoostyClient) get(ctx context.Context, rawURL string, params url.Values
 	return nil, lastErr
 }
 
+// isRetryableStatus сообщает, имеет ли смысл повторять запрос при таком статусе.
+// 429 попадает сюда наравне с 5xx: это временный лимит, а не отказ.
+func isRetryableStatus(status int) bool {
+	return status >= 500 || status == http.StatusTooManyRequests
+}
+
+// parseRetryAfter разбирает заголовок Retry-After в обеих допустимых формах:
+// число секунд или HTTP-дата. Значение подрезается до retryAfterCap.
+func parseRetryAfter(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return min(time.Duration(secs)*time.Second, retryAfterCap), true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d <= 0 {
+			return 0, false
+		}
+		return min(d, retryAfterCap), true
+	}
+	return 0, false
+}
+
+// backoffDelay возвращает экспоненциальную задержку с джиттером: без него
+// все повторы после сетевого сбоя уходят на сервер одновременно.
 func backoffDelay(attempt int) time.Duration {
-	return apiRetryBaseDelay << uint(attempt-1)
+	base := apiRetryBaseDelay << uint(attempt-1)
+	return base + time.Duration(rand.Int63n(int64(base/2)))
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {
@@ -136,7 +191,7 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 
 // blogPostCount возвращает общее число постов автора.
 func (c *BoostyClient) blogPostCount(ctx context.Context, author string) (int, error) {
-	data, err := c.get(ctx, fmt.Sprintf("%s/v1/blog/%s", apiBase, author), nil)
+	data, err := c.get(ctx, fmt.Sprintf("%s/v1/blog/%s", apiBase, url.PathEscape(author)), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -166,7 +221,7 @@ func (c *BoostyClient) iterPosts(ctx context.Context, author string) (<-chan Pos
 				params.Set("offset", offset)
 			}
 
-			data, err := c.get(ctx, fmt.Sprintf("%s/v1/blog/%s/post/", apiBase, author), params)
+			data, err := c.get(ctx, fmt.Sprintf("%s/v1/blog/%s/post/", apiBase, url.PathEscape(author)), params)
 			if err != nil {
 				errCh <- err
 				return
@@ -203,6 +258,43 @@ func (c *BoostyClient) iterPosts(ctx context.Context, author string) (<-chan Pos
 	return out, errCh
 }
 
+// mediaURL возвращает ссылку на вложение с учётом подписи поста.
+func mediaURL(post *Post, m *MediaItem) string {
+	switch m.Kind {
+	case MediaVideo:
+		return m.bestURL()
+	case MediaAudio, MediaFile:
+		if post.SignedQuery == "" {
+			return ""
+		}
+		return signURL(m.URL, post.SignedQuery)
+	default:
+		return m.URL
+	}
+}
+
+// refreshMediaURL перезапрашивает пост и возвращает свежую ссылку на то же
+// вложение. Нужно потому, что подписанные ссылки boosty живут недолго: на
+// большом блоге ссылка успевает протухнуть, пока задача стоит в очереди.
+func (c *BoostyClient) refreshMediaURL(ctx context.Context, author, postID, mediaID string) (string, error) {
+	data, err := c.get(ctx, fmt.Sprintf("%s/v1/blog/%s/post/%s",
+		apiBase, url.PathEscape(author), url.PathEscape(postID)), nil)
+	if err != nil {
+		return "", err
+	}
+	post := parsePost(data)
+	for i := range post.Media {
+		if post.Media[i].ID == mediaID {
+			u := mediaURL(&post, &post.Media[i])
+			if u == "" {
+				return "", fmt.Errorf("вложение %s без ссылки", mediaID)
+			}
+			return u, nil
+		}
+	}
+	return "", fmt.Errorf("вложение %s не найдено в посте %s", mediaID, postID)
+}
+
 func parsePost(raw map[string]any) Post {
 	post := Post{
 		ID:          asString(raw["id"]),
@@ -210,10 +302,7 @@ func parsePost(raw map[string]any) Post {
 		Title:       asString(raw["title"]),
 		SignedQuery: asString(raw["signedQuery"]),
 	}
-	if intID, ok := raw["intId"].(float64); ok {
-		post.IntID = int64(intID)
-	}
-	if pt, ok := raw["publishTime"].(float64); ok {
+	if pt, ok := asFloat(raw["publishTime"]); ok {
 		post.PublishTime = int64(pt)
 	}
 
@@ -292,8 +381,19 @@ func parseMedia(b map[string]any) *MediaItem {
 		}
 		return &MediaItem{Kind: MediaFile, ID: id, URL: asString(b["url"]), Title: title}
 
+	case "external_video":
+		u := asString(b["url"])
+		if u == "" {
+			return nil
+		}
+		title := asString(b["title"])
+		if title == "" {
+			title = id
+		}
+		return &MediaItem{Kind: MediaExternal, ID: id, URL: u, Title: title}
+
 	default:
-		// external_video (YouTube/Vimeo) и неизвестные типы — пропускаем
+		// Неизвестные типы блоков пропускаем.
 		return nil
 	}
 }

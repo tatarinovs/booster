@@ -1,0 +1,15 @@
+# Go-файлы всегда хранятся и выгружаются с LF: иначе gofmt в CI (Linux)
+# считает неотформатированным весь проект из-за CRLF.
+*.go text eol=lf
+go.mod text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+
+# Windows-скрипты, наоборот, должны быть с CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Двоичные файлы не трогать.
+*.ico binary
+*.exe binary
+*.syso binary

@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -31,69 +31,114 @@ func blockTextAndStyles(contentJSON string) (text string, blockType string, styl
 	return text, blockType, styles
 }
 
-// applyStyles применяет жирный, курсив и подчеркивание к тексту.
-// Работает за O(n + m·log m): однопроходная сборка через strings.Builder.
+// 0: BOLD (**), 2: ITALIC (*), 4: UNDERLINE (__)
+var styleTags = map[int]string{0: "**", 2: "*", 4: "__"}
+
+// styleOrder задаёт детерминированный порядок вложения тегов.
+var styleOrder = []int{0, 2, 4}
+
+// applyStyles применяет жирный, курсив и подчёркивание к тексту.
+//
+// Диапазоны стилей сначала раскладываются в набор активных стилей на каждой руне,
+// а затем один проход открывает и закрывает теги по стеку. За счёт этого
+// пересекающиеся и дублирующие друг друга диапазоны одного стиля схлопываются
+// в одну пару тегов, а вложенность не ломается.
+//
+// Данные приходят из внешнего API, поэтому все поля извлекаются через asFloat:
+// раньше здесь стояли непроверенные приведения типов, и любое нечисловое
+// значение роняло весь процесс паникой.
 func applyStyles(text string, styles []any) string {
 	if len(styles) == 0 {
 		return text
 	}
 
-	// 0: BOLD (**), 2: ITALIC (*), 4: UNDERLINE (__)
-	styleMap := map[int]string{0: "**", 2: "*", 4: "__"}
-
-	type point struct {
-		pos int
-		tag string
-	}
-	var points []point
-
 	runes := []rune(text)
 	textLen := len(runes)
+	if textLen == 0 {
+		return text
+	}
+
+	// active[i] — множество стилей, действующих на руне i.
+	active := make([]map[int]bool, textLen)
+	matched := false
 
 	for _, s := range styles {
 		arr, ok := s.([]any)
 		if !ok || len(arr) != 3 {
 			continue
 		}
-		styleID := int(arr[0].(float64))
-		offset := int(arr[1].(float64))
-		length := int(arr[2].(float64))
-		if offset > textLen {
+		idF, okID := asFloat(arr[0])
+		offF, okOff := asFloat(arr[1])
+		lenF, okLen := asFloat(arr[2])
+		if !okID || !okOff || !okLen {
 			continue
 		}
-		tag, exists := styleMap[styleID]
-		if !exists {
+		styleID, offset, length := int(idF), int(offF), int(lenF)
+		if _, known := styleTags[styleID]; !known {
 			continue
 		}
-		endPos := offset + length
-		if endPos > textLen {
-			endPos = textLen
+		// Отрицательное смещение раньше приводило к выходу за границы среза.
+		if offset < 0 {
+			length += offset
+			offset = 0
 		}
-		points = append(points, point{offset, tag}, point{endPos, tag})
+		if length <= 0 || offset >= textLen {
+			continue
+		}
+		end := offset + length
+		if end > textLen {
+			end = textLen
+		}
+		for i := offset; i < end; i++ {
+			if active[i] == nil {
+				active[i] = make(map[int]bool, 2)
+			}
+			active[i][styleID] = true
+		}
+		matched = true
 	}
 
-	if len(points) == 0 {
+	if !matched {
 		return text
 	}
 
-	// Сортировка по возрастанию для однопроходной вставки слева направо.
-	sort.SliceStable(points, func(i, j int) bool {
-		return points[i].pos < points[j].pos
-	})
-
 	var sb strings.Builder
-	sb.Grow(len(text) + len(points)*4)
+	sb.Grow(len(text) + 16)
 
-	lastPos := 0
-	for _, p := range points {
-		if p.pos > lastPos {
-			sb.WriteString(string(runes[lastPos:p.pos]))
+	var open []int // стек открытых стилей
+	for i := 0; i <= textLen; i++ {
+		var cur map[int]bool
+		if i < textLen {
+			cur = active[i]
 		}
-		sb.WriteString(p.tag)
-		lastPos = p.pos
-	}
-	if lastPos < textLen {
-		sb.WriteString(string(runes[lastPos:]))
+
+		// Раскручиваем стек до самого глубокого стиля, который больше не
+		// действует; всё, что лежало выше него, переоткроется ниже.
+		cut := -1
+		for idx, id := range open {
+			if !cur[id] {
+				cut = idx
+				break
+			}
+		}
+		if cut >= 0 {
+			for j := len(open) - 1; j >= cut; j-- {
+				sb.WriteString(styleTags[open[j]])
+			}
+			open = open[:cut]
+		}
+
+		for _, id := range styleOrder {
+			if !cur[id] || slices.Contains(open, id) {
+				continue
+			}
+			sb.WriteString(styleTags[id])
+			open = append(open, id)
+		}
+
+		if i < textLen {
+			sb.WriteRune(runes[i])
+		}
 	}
 
 	return sb.String()

@@ -1,4 +1,4 @@
-//go:generate goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest
+//go:generate goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest -64=true
 
 package main
 
@@ -14,6 +14,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// version подставляется при сборке через -ldflags "-X main.version=v1.2.3".
+// В обычной сборке остаётся dev — так видно, что бинарник собран не из релиза.
+var version = "dev"
 
 func scriptDir() string {
 	exe, err := os.Executable()
@@ -35,7 +39,24 @@ func main() {
 	flag.StringVar(output, "o", "", "Папка для загрузок (сокращение)")
 	flat := flag.Bool("flat", false, "Все файлы в одну папку без подпапок по постам")
 	flag.BoolVar(flat, "f", false, "Все файлы в одну папку без подпапок по постам (сокращение)")
+	noWait := flag.Bool("no-wait", false, "Не ждать Enter перед выходом (для скриптов)")
+	workers := flag.Int("workers", defaultWorkers,
+		fmt.Sprintf("Число параллельных загрузок (1..%d)", maxWorkers))
+	flag.IntVar(workers, "w", defaultWorkers, "Число параллельных загрузок (сокращение)")
+	noGalleries := flag.Bool("no-galleries", false,
+		"Не скачивать фото из внешних галерей, на которые ссылаются посты")
+	showVersion := flag.Bool("version", false, "Показать версию и выйти")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("booster %s\n", version)
+		return
+	}
+
+	if *workers < 1 || *workers > maxWorkers {
+		fmt.Printf("Число воркеров должно быть от 1 до %d (указано %d).\n", maxWorkers, *workers)
+		os.Exit(1)
+	}
 
 	dir := scriptDir()
 
@@ -79,20 +100,32 @@ func main() {
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	defer ctxCancel()
 
+	var runFailed atomic.Bool
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		// Паника в парсинге ответа API не должна уносить весь процесс без сводки.
+		defer func() {
+			if r := recover(); r != nil {
+				logError("Неожиданная ошибка: %v", r)
+				runFailed.Store(true)
+			}
+		}()
 		opts := runOptions{
-			author:    nick,
-			token:     token,
-			outputDir: outputDir,
-			isFlat:    *flat,
-			cancel:    &cancelFlag,
-			abort:     &abortFlag,
-			stats:     stats,
+			author:      nick,
+			token:       token,
+			outputDir:   outputDir,
+			isFlat:      *flat,
+			workers:     *workers,
+			noGalleries: *noGalleries,
+			cancel:      &cancelFlag,
+			abort:       &abortFlag,
+			stats:       stats,
 		}
 		if err := run(ctx, opts); err != nil {
 			logError("Критическая ошибка: %v", err)
+			runFailed.Store(true)
 		}
 	}()
 
@@ -109,10 +142,10 @@ loop:
 			interrupts++
 			switch interrupts {
 			case 1:
-				fmt.Fprint(os.Stderr, "\r\033[K\033[33m[СТОП] Завершаем текущие загрузки... (повторный Ctrl+C — прервать немедленно)\033[0m\n")
+				logWarn("[СТОП] Завершаем текущие загрузки... (повторный Ctrl+C — прервать немедленно)")
 				cancelFlag.Store(true)
 			case 2:
-				fmt.Fprint(os.Stderr, "\r\033[K\033[1;31m[ПРИНУДИТЕЛЬНО] Прерываем активные загрузки...\033[0m\n")
+				logError("[ПРИНУДИТЕЛЬНО] Прерываем активные загрузки...")
 				abortFlag.Store(true)
 				ctxCancel()
 			default:
@@ -124,7 +157,28 @@ loop:
 
 	stats.printSummary()
 
-	fmt.Print("\nНажмите Enter для выхода...")
-	reader := bufio.NewReader(os.Stdin)
-	_, _ = reader.ReadString('\n')
+	// Ждём Enter только в интерактивном режиме: при запуске из скрипта или
+	// планировщика процесс иначе висел бы вечно.
+	if !*noWait && isTerminal(os.Stdin) {
+		fmt.Print("\nНажмите Enter для выхода...")
+		reader := bufio.NewReader(os.Stdin)
+		_, _ = reader.ReadString('\n')
+	}
+
+	os.Exit(exitCode(runFailed.Load(), interrupts > 0, stats))
+}
+
+// exitCode переводит итог работы в код возврата, чтобы вызывающий скрипт
+// мог отличить успех от частичной или полной неудачи.
+func exitCode(failed, interrupted bool, stats *Stats) int {
+	switch {
+	case failed:
+		return 1
+	case stats.errorCount() > 0:
+		return 2
+	case interrupted:
+		return 130 // прервано по сигналу, как принято в шелле
+	default:
+		return 0
+	}
 }

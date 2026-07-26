@@ -25,8 +25,13 @@ type AuthToken struct {
 	ExpiresAt     int64 // unix timestamp в секундах
 }
 
+// expiryMargin — запас, с которым токен считается истёкшим. Без него токен,
+// живущий последние секунды, проходит проверку, а API затем отдаёт 401 уже
+// посреди загрузки.
+const expiryMargin = 60
+
 func (t *AuthToken) IsExpired() bool {
-	return time.Now().Unix() >= t.ExpiresAt
+	return time.Now().Unix()+expiryMargin >= t.ExpiresAt
 }
 
 type rawToken struct {

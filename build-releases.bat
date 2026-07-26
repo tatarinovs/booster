@@ -18,8 +18,11 @@ if errorlevel 1 (
 echo [*] Generating Windows (amd64) resources...
 cd cmd\booster
 goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest -64=true
+if errorlevel 1 (
+    cd ..\..
+    exit /b 1
+)
 cd ..\..
-if errorlevel 1 exit /b 1
 
 echo [*] Building Windows (amd64)...
 set GOOS=windows
@@ -37,8 +40,11 @@ if not errorlevel 1 (
 echo [*] Generating Windows (x86) resources...
 cd cmd\booster
 goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest -64=false
+if errorlevel 1 (
+    cd ..\..
+    exit /b 1
+)
 cd ..\..
-if errorlevel 1 exit /b 1
 
 echo [*] Building Windows (x86)...
 set GOOS=windows

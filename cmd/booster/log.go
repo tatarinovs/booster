@@ -8,12 +8,22 @@ import (
 
 var logMu sync.Mutex
 
+// ansiEnabled — можно ли писать escape-последовательности. При перенаправлении
+// вывода в файл или пайп они превращаются в мусор вида «[K[33m», поэтому и
+// цвета, и индикатор прогресса включаются только для настоящей консоли.
+var ansiEnabled = isTerminal(os.Stderr)
+
 // clearAndLog печатает сообщение, предварительно затерев текущую строку прогресса
 // (аналог tqdm.write в питоновской версии — чтобы не ломать индикатор прогресса).
 func clearAndLog(level, format string, args ...any) {
 	logMu.Lock()
 	defer logMu.Unlock()
 	msg := fmt.Sprintf(format, args...)
+
+	if !ansiEnabled {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
 
 	var color string
 	switch level {

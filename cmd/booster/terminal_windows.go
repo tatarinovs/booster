@@ -3,6 +3,7 @@
 package main
 
 import (
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -21,6 +22,17 @@ func init() {
 			procSet.Call(uintptr(h), uintptr(mode))
 		}
 	}
+}
+
+// isTerminal сообщает, подключён ли файл к настоящей консоли.
+// Проверка через GetConsoleMode, а не по ModeCharDevice: NUL тоже символьное
+// устройство, и при запуске из планировщика ожидание Enter печаталось бы зря.
+func isTerminal(f *os.File) bool {
+	var mode uint32
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	procGet := kernel32.NewProc("GetConsoleMode")
+	ret, _, _ := procGet.Call(f.Fd(), uintptr(unsafe.Pointer(&mode)))
+	return ret != 0
 }
 
 func terminalWidth() int {

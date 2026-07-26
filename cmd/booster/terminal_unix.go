@@ -64,6 +64,15 @@ func updateTerminalWidth() {
 	cachedWidth.Store(100)
 }
 
+// isTerminal сообщает, подключён ли файл к терминалу, а не к пайпу или файлу.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 func terminalWidth() int {
 	w := int(cachedWidth.Load())
 	if w <= 0 {
