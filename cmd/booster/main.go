@@ -45,6 +45,8 @@ func main() {
 	flag.IntVar(workers, "w", defaultWorkers, "Число параллельных загрузок (сокращение)")
 	noGalleries := flag.Bool("no-galleries", false,
 		"Не скачивать фото из внешних галерей, на которые ссылаются посты")
+	fullCheck := flag.Bool("full", false,
+		"Проверить все посты, а не только новые (например, после смены уровня подписки)")
 	showVersion := flag.Bool("version", false, "Показать версию и выйти")
 	flag.Parse()
 
@@ -119,6 +121,7 @@ func main() {
 			isFlat:      *flat,
 			workers:     *workers,
 			noGalleries: *noGalleries,
+			fullCheck:   *fullCheck,
 			cancel:      &cancelFlag,
 			abort:       &abortFlag,
 			stats:       stats,
@@ -154,6 +157,8 @@ loop:
 			}
 		}
 	}
+	// Дальше Ctrl+C должен работать как обычно — например, на запросе Enter.
+	signal.Stop(sigCh)
 
 	stats.printSummary()
 

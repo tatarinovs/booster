@@ -8,14 +8,19 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 )
 
-var cachedWidth atomic.Int32
+var (
+	cachedWidth atomic.Int32
+	widthOnce   sync.Once
+)
 
-func init() {
-	// Инициализируем кэш ширины один раз при старте
+// initTerminalWidth определяет ширину при первой отрисовке, а не в init():
+// иначе tput и stty запускались бы даже для --version и при выводе в файл.
+func initTerminalWidth() {
 	updateTerminalWidth()
 
 	// Подписываемся на SIGWINCH (изменение размера окна терминала)
@@ -27,6 +32,9 @@ func init() {
 		}
 	}()
 }
+
+// ansiSupported сообщает, можно ли писать escape-последовательности.
+func ansiSupported() bool { return isTerminal(os.Stderr) }
 
 func updateTerminalWidth() {
 	// 1. Пробуем переменную окружения (часто ставится шеллом)
@@ -74,6 +82,7 @@ func isTerminal(f *os.File) bool {
 }
 
 func terminalWidth() int {
+	widthOnce.Do(initTerminalWidth)
 	w := int(cachedWidth.Load())
 	if w <= 0 {
 		return 100

@@ -111,10 +111,12 @@ func saveToken(scriptDir string, token *AuthToken) {
 }
 
 // authJS — скрипт для получения токена из браузера (boosty.to → F12 → Console).
-const authJS = `(function(){function getDecodedCookie(cookieName){const cookies=document.cookie.split(';')` +
-	`,r={'%22':'"','%3A':':','%2C':',','%7B':'{','%7D':'}'};for(let c of cookies){` +
-	`const [n,v]=c.trim().split('=');if(n===cookieName&&v){let d=v;` +
-	`Object.entries(r).forEach(([e,dec])=>d=d.replaceAll(e,dec));return d}}return null}` +
+// Значение cookie делится по первому «=» и декодируется целиком через
+// decodeURIComponent: раньше split('=') обрезал значение на первом «=»,
+// а ручная замена пяти %XX ломалась на любом другом экранированном символе.
+const authJS = `(function(){function getDecodedCookie(cookieName){for(let c of document.cookie.split(';')){` +
+	`c=c.trim();const i=c.indexOf('=');if(i>0&&c.slice(0,i)===cookieName&&i<c.length-1){` +
+	`try{return decodeURIComponent(c.slice(i+1))}catch(e){return null}}}return null}` +
 	`if(window.location.hostname==='boosty.to'){const authCookie=getDecodedCookie("auth");` +
 	`if(authCookie){const authObj=JSON.parse(authCookie),token={authorization:authObj.accessToken,` +
 	`expires_in:authObj.expiresAt,full_cookie:document.cookie};` +

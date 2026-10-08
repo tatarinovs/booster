@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +25,25 @@ const (
 // downloadRetryDelay — пауза между попытками. Переменная, а не константа,
 // чтобы тесты не ждали реальные секунды.
 var downloadRetryDelay = 3 * time.Second
+
+// downloadIdleTimeout — сколько ждать очередной порции данных, прежде чем
+// считать соединение зависшим. Общего таймаута у клиента нет (файлы бывают
+// большими), и без этой проверки замолчавший CDN навсегда занимал воркер.
+var downloadIdleTimeout = 60 * time.Second
+
+// contentRangeTotal достаёт полный размер файла из Content-Range
+// («bytes 0-99/1234» или «bytes */1234»).
+func contentRangeTotal(v string) (int64, bool) {
+	i := strings.LastIndexByte(v, '/')
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v[i+1:]), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
 
 var bufferPool = sync.Pool{
 	New: func() any {
@@ -110,15 +132,23 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 		// Файл на месте, но обработка могла не доехать: архив галереи,
 		// скачанный в прошлый раз, мог остаться нераспакованным. Иначе он
 		// пролежал бы мёртвым грузом, а фото так и не появились бы.
-		if task.AfterDownload != nil {
-			if err := task.AfterDownload(task.Dest); err != nil {
-				logError("Обработка %s не удалась: %v", filepath.Base(task.Dest), err)
-				stats.record(task.MediaType, false, true)
-				return
-			}
+		if task.AfterDownload == nil {
+			stats.record(task.MediaType, true, false)
+			return
 		}
-		stats.record(task.MediaType, true, false)
-		return
+		err := task.AfterDownload(task.Dest)
+		if err == nil {
+			stats.record(task.MediaType, true, false)
+			return
+		}
+		if _, serr := os.Stat(task.Dest); serr == nil {
+			logError("Обработка %s не удалась: %v", filepath.Base(task.Dest), err)
+			stats.record(task.MediaType, false, true)
+			return
+		}
+		// Обработчик удалил испорченный файл (битый архив) — скачиваем заново,
+		// иначе ошибка повторялась бы при каждом запуске.
+		logWarn("%s повреждён, скачиваем заново: %v", filepath.Base(task.Dest), err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(task.Dest), 0o755); err != nil {
@@ -140,6 +170,14 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 		u, err := task.Resolve(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
+				return
+			}
+			// Платная галерея или ссылка не на галерею — это свойство материала,
+			// а не сбой. Как ошибка она навсегда блокировала бы отметку
+			// синхронизации и давала код возврата 2 при каждом запуске.
+			if errors.Is(err, errUnavailable) {
+				logWarn("Пропущено %s: %v", filepath.Base(task.Dest), err)
+				stats.incUnavailable()
 				return
 			}
 			logError("Не удалось получить ссылку для %s: %v", filepath.Base(task.Dest), err)
@@ -177,6 +215,26 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 	}
 	baseHeaders := headersFor(task.URL)
 
+	// finish превращает скачанный целиком .part в итоговый файл и запускает
+	// постобработку. Ошибки учитывает сам.
+	finish := func() {
+		if err := safeReplace(part, task.Dest); err != nil {
+			logError("Ошибка переименования %s: %v", task.Dest, err)
+			appendFailed(failedPath, task.Dest, task.URL)
+			stats.record(task.MediaType, false, true)
+			return
+		}
+		if task.AfterDownload != nil {
+			if err := task.AfterDownload(task.Dest); err != nil {
+				logError("Обработка %s не удалась: %v", filepath.Base(task.Dest), err)
+				appendFailed(failedPath, task.Dest, task.URL)
+				stats.record(task.MediaType, false, true)
+				return
+			}
+		}
+		stats.record(task.MediaType, false, false)
+	}
+
 	deletedPart := false
 	refreshed := false
 
@@ -211,17 +269,13 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 
 		if resp.StatusCode == 400 || resp.StatusCode == 403 {
 			resp.Body.Close()
-			if partSize > 0 && !deletedPart {
-				logInfo("CDN отклонил Range для %s, качаем заново", filepath.Base(task.Dest))
-				_ = safeUnlink(part)
-				partSize = 0
-				discard()
-				deletedPart = true
-				continue // сразу повторяем без sleep
-			}
 			// Подпись ссылки протухла, пока задача ждала в очереди. Перезапрашиваем
 			// пост и берём свежую ссылку — на большом блоге это основная причина
 			// потерь, и без обновления файл ушёл бы в failed.txt.
+			//
+			// Ссылка обновляется раньше, чем выбрасывается .part: иначе после обрыва
+			// посреди запуска протухшая подпись стоила бы всего уже скачанного
+			// куска, хотя дело было не в Range.
 			if !refreshed && (task.Resolve != nil || (task.PostID != "" && task.MediaID != "")) {
 				refreshed = true
 				var fresh string
@@ -231,19 +285,42 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 				} else {
 					fresh, rerr = client.refreshMediaURL(ctx, d.author, task.PostID, task.MediaID)
 				}
-				if rerr != nil {
-					logError("Не удалось обновить ссылку для %s: %v", filepath.Base(task.Dest), rerr)
-				} else if fresh == task.URL {
-					logError("HTTP %d, ссылка не изменилась: %s", resp.StatusCode, task.URL)
-				} else {
+				switch {
+				case rerr != nil:
+					logWarn("Не удалось обновить ссылку для %s: %v", filepath.Base(task.Dest), rerr)
+				case fresh != task.URL:
 					logInfo("Ссылка протухла, обновлена: %s", filepath.Base(task.Dest))
 					task.URL = fresh
 					baseHeaders = headersFor(fresh)
 					continue // повторяем со свежей ссылкой
 				}
 			}
+			if partSize > 0 && !deletedPart {
+				logInfo("CDN отклонил Range для %s, качаем заново", filepath.Base(task.Dest))
+				_ = safeUnlink(part)
+				partSize = 0
+				discard()
+				deletedPart = true
+				continue // сразу повторяем без sleep
+			}
 			logError("HTTP %d (протухший URL?): %s", resp.StatusCode, task.URL)
 			break
+		}
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && partSize > 0 {
+			resp.Body.Close()
+			// .part уже скачан целиком, но в прошлый раз не был переименован
+			// (процесс прервали или антивирус держал файл). Без этой ветки сервер
+			// отвечал бы 416 при каждом запуске и файл не появился бы никогда.
+			if total, ok := contentRangeTotal(resp.Header.Get("Content-Range")); ok && total == partSize {
+				finish()
+				return
+			}
+			logInfo("Сервер отклонил докачку %s, качаем заново", filepath.Base(task.Dest))
+			_ = safeUnlink(part)
+			partSize = 0
+			discard()
+			deletedPart = true
+			continue
 		}
 		if resp.StatusCode == 404 {
 			resp.Body.Close()
@@ -280,6 +357,14 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 			continue
 		}
 
+		// Сторож закрывает тело ответа, если данные перестали приходить:
+		// закрытие из другой горутины прерывает заблокированный Read.
+		var stalled atomic.Bool
+		watchdog := time.AfterFunc(downloadIdleTimeout, func() {
+			stalled.Store(true)
+			resp.Body.Close()
+		})
+
 		bufPtr := bufferPool.Get().(*[]byte)
 		buf := *bufPtr
 		var writeErr error
@@ -291,6 +376,7 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 			}
 			n, rerr := resp.Body.Read(buf)
 			if n > 0 {
+				watchdog.Reset(downloadIdleTimeout)
 				if _, werr := f.Write(buf[:n]); werr != nil {
 					writeErr = werr
 					break
@@ -307,9 +393,15 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 				break
 			}
 		}
-		f.Close()
+		watchdog.Stop()
+		if cerr := f.Close(); cerr != nil && writeErr == nil {
+			writeErr = cerr
+		}
 		resp.Body.Close()
 		bufferPool.Put(bufPtr)
+		if stalled.Load() && writeErr != nil {
+			writeErr = fmt.Errorf("нет данных дольше %v, соединение зависло", downloadIdleTimeout)
+		}
 
 		if aborted {
 			return // .part остаётся для докачки при следующем запуске
@@ -329,20 +421,8 @@ func (d *downloader) downloadOne(ctx context.Context, task DownloadTask) {
 			continue
 		}
 
-		if err := safeReplace(part, task.Dest); err != nil {
-			logError("Ошибка переименования %s: %v", task.Dest, err)
-			break
-		}
-		if task.AfterDownload != nil {
-			if err := task.AfterDownload(task.Dest); err != nil {
-				logError("Обработка %s не удалась: %v", filepath.Base(task.Dest), err)
-				appendFailed(failedPath, task.Dest, task.URL)
-				stats.record(task.MediaType, false, true)
-				return
-			}
-		}
-		stats.record(task.MediaType, false, false)
-		return // успех
+		finish()
+		return
 	}
 
 	// Все попытки исчерпаны (или произошёл ранний break)

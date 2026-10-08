@@ -21,13 +21,14 @@ import (
 func newTestGalleryClient() *galleryClient {
 	c := newGalleryClient()
 	c.interval = 0
+	c.allowPrivate = true // httptest слушает 127.0.0.1
 	return c
 }
 
 func TestParseGalleryURL(t *testing.T) {
 	ok := []struct{ in, base, slug string }{
-		{"https://pavelkrasnov.com/disk/lina-mc96q3", "https://pavelkrasnov.com", "lina-mc96q3"},
-		{"https://pavelkrasnov.com/disk/lina-mc96q3/", "https://pavelkrasnov.com", "lina-mc96q3"},
+		{"https://photos.example.com/disk/album-x1y2z3", "https://photos.example.com", "album-x1y2z3"},
+		{"https://photos.example.com/disk/album-x1y2z3/", "https://photos.example.com", "album-x1y2z3"},
 		{"http://example.com/disk/abc123", "http://example.com", "abc123"},
 		{"  https://example.com/disk/a.b_c-d  ", "https://example.com", "a.b_c-d"},
 	}
@@ -45,10 +46,10 @@ func TestParseGalleryURL(t *testing.T) {
 
 	bad := []string{
 		"https://boosty.to/pvlkrsnv",
-		"https://example.com/disk",       // без слага
-		"https://example.com/disk/a/b",   // вложенный путь — не галерея
-		"https://example.com/other/lina", // другой раздел
-		"ftp://example.com/disk/lina",    // не http
+		"https://example.com/disk",        // без слага
+		"https://example.com/disk/a/b",    // вложенный путь — не галерея
+		"https://example.com/other/album", // другой раздел
+		"ftp://example.com/disk/album",    // не http
 		"не ссылка",
 		"",
 	}
@@ -61,9 +62,9 @@ func TestParseGalleryURL(t *testing.T) {
 
 func TestFindGalleryLinks(t *testing.T) {
 	blocks := []map[string]any{
-		{"type": "link", "url": "https://pavelkrasnov.com/disk/lina-mc96q3"},
+		{"type": "link", "url": "https://photos.example.com/disk/album-x1y2z3"},
 		{"type": "text", "content": `["Смотрите тут https://example.com/disk/second, а также","unstyled",[]]`},
-		{"type": "link", "url": "https://pavelkrasnov.com/disk/lina-mc96q3"}, // дубль
+		{"type": "link", "url": "https://photos.example.com/disk/album-x1y2z3"}, // дубль
 		{"type": "text", "content": `["Просто текст без ссылок","unstyled",[]]`},
 		{"type": "link", "url": "https://youtube.com/watch?v=x"}, // не галерея
 	}
@@ -72,7 +73,7 @@ func TestFindGalleryLinks(t *testing.T) {
 	if len(refs) != 2 {
 		t.Fatalf("найдено %d галерей, ожидалось 2: %+v", len(refs), refs)
 	}
-	if refs[0].Slug != "lina-mc96q3" {
+	if refs[0].Slug != "album-x1y2z3" {
 		t.Errorf("первая галерея: %q", refs[0].Slug)
 	}
 	if refs[1].Slug != "second" {
@@ -183,10 +184,10 @@ func (f *fakeWfolio) zipBytes(t *testing.T) []byte {
 }
 
 func TestGalleryArchiveURL(t *testing.T) {
-	f := &fakeWfolio{slug: "lina", files: map[string]string{"Lina/Photos/a.jpg": "x"}}
+	f := &fakeWfolio{slug: "album", files: map[string]string{"Album/Photos/a.jpg": "x"}}
 	srv := f.start(t)
 
-	ref, _ := parseGalleryURL(srv.URL + "/disk/lina")
+	ref, _ := parseGalleryURL(srv.URL + "/disk/album")
 	u, err := newTestGalleryClient().archiveURL(context.Background(), ref)
 	if err != nil {
 		t.Fatalf("archiveURL: %v", err)
@@ -231,16 +232,16 @@ func TestGalleryRejectsNonWfolioPage(t *testing.T) {
 func TestExtractGallery(t *testing.T) {
 	dir := t.TempDir()
 	f := &fakeWfolio{files: map[string]string{
-		"Lina/Photos/DSCF1.jpg": "первое фото",
-		"Lina/Photos/DSCF2.jpg": "второе фото",
-		"Lina/Video/clip.mp4":   "видео",
+		"Album/Photos/DSCF1.jpg": "первое фото",
+		"Album/Photos/DSCF2.jpg": "второе фото",
+		"Album/Video/clip.mp4":   "видео",
 	}}
 	zipPath := filepath.Join(dir, "g.zip")
 	if err := os.WriteFile(zipPath, f.zipBytes(t), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	dest := filepath.Join(dir, "gallery_lina")
+	dest := filepath.Join(dir, "gallery_album")
 	n, err := extractGallery(zipPath, dest)
 	if err != nil {
 		t.Fatalf("extractGallery: %v", err)
@@ -249,7 +250,7 @@ func TestExtractGallery(t *testing.T) {
 		t.Errorf("извлечено %d файлов, ожидалось 3", n)
 	}
 
-	// Общий верхний каталог Lina/ убирается: галерея уже лежит в своей папке.
+	// Общий верхний каталог Album/ убирается: галерея уже лежит в своей папке.
 	got, err := os.ReadFile(filepath.Join(dest, "Photos", "DSCF1.jpg"))
 	if err != nil {
 		t.Fatalf("файл не распакован: %v", err)
@@ -330,9 +331,9 @@ func TestStripCommonRoot(t *testing.T) {
 		names []string
 		want  string
 	}{
-		{[]string{"Lina/a.jpg", "Lina/b/c.jpg"}, "Lina"},
-		{[]string{"Lina/a.jpg", "Другая/b.jpg"}, ""}, // разные корни
-		{[]string{"a.jpg", "Lina/b.jpg"}, ""},        // файл в корне архива
+		{[]string{"Album/a.jpg", "Album/b/c.jpg"}, "Album"},
+		{[]string{"Album/a.jpg", "Другая/b.jpg"}, ""}, // разные корни
+		{[]string{"a.jpg", "Album/b.jpg"}, ""},        // файл в корне архива
 		{[]string{}, ""},
 	}
 	for _, tt := range tests {
@@ -343,12 +344,12 @@ func TestStripCommonRoot(t *testing.T) {
 }
 
 func TestGalleryTasks(t *testing.T) {
-	f := &fakeWfolio{slug: "lina", files: map[string]string{"Lina/a.jpg": "фото"}}
+	f := &fakeWfolio{slug: "album", files: map[string]string{"Album/a.jpg": "фото"}}
 	srv := f.start(t)
 
 	dir := t.TempDir()
 	post := &Post{ID: "post-1", TextBlocks: []map[string]any{
-		{"type": "link", "url": srv.URL + "/disk/lina"},
+		{"type": "link", "url": srv.URL + "/disk/album"},
 	}}
 	stats := newStats()
 
@@ -365,7 +366,7 @@ func TestGalleryTasks(t *testing.T) {
 	if task.URL != "" || task.Resolve == nil || task.AfterDownload == nil {
 		t.Fatalf("задача заполнена неверно: %+v", task)
 	}
-	if filepath.Base(task.Dest) != "gallery_lina.zip" {
+	if filepath.Base(task.Dest) != "gallery_album.zip" {
 		t.Errorf("Dest = %q", task.Dest)
 	}
 	if stats.galleries != 1 {
@@ -375,11 +376,11 @@ func TestGalleryTasks(t *testing.T) {
 
 // Уже распакованная галерея пропускается без единого обращения к сайту.
 func TestGalleryTasksSkipsCompleted(t *testing.T) {
-	f := &fakeWfolio{slug: "lina", files: map[string]string{"a.jpg": "x"}}
+	f := &fakeWfolio{slug: "album", files: map[string]string{"a.jpg": "x"}}
 	srv := f.start(t)
 
 	dir := t.TempDir()
-	done := filepath.Join(dir, "gallery_lina")
+	done := filepath.Join(dir, "gallery_album")
 	if err := os.MkdirAll(done, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +389,7 @@ func TestGalleryTasksSkipsCompleted(t *testing.T) {
 	}
 
 	post := &Post{ID: "p", TextBlocks: []map[string]any{
-		{"type": "link", "url": srv.URL + "/disk/lina"},
+		{"type": "link", "url": srv.URL + "/disk/album"},
 	}}
 	tasks := galleryTasks(context.Background(), newTestGalleryClient(), post, dir, newStats())
 	if len(tasks) != 0 {
@@ -401,11 +402,11 @@ func TestGalleryTasksSkipsCompleted(t *testing.T) {
 
 // Сайт отвечает 403 на всё: после нескольких отказов клиент прекращает запросы.
 func TestGalleryStopsAfterRepeatedRejections(t *testing.T) {
-	f := &fakeWfolio{slug: "lina", reject: true}
+	f := &fakeWfolio{slug: "album", reject: true}
 	srv := f.start(t)
 
 	c := newTestGalleryClient()
-	ref, _ := parseGalleryURL(srv.URL + "/disk/lina")
+	ref, _ := parseGalleryURL(srv.URL + "/disk/album")
 
 	var lastErr error
 	for i := 0; i < 10; i++ {

@@ -11,7 +11,7 @@ echo.
 where goversioninfo >nul 2>&1
 if errorlevel 1 (
     echo [*] goversioninfo not found, installing...
-    go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+    go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0
 )
 
 :: 1. Windows

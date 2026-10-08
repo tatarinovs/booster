@@ -8,7 +8,7 @@ echo.
 where goversioninfo >nul 2>&1
 if errorlevel 1 (
     echo [INFO] goversioninfo not found, installing...
-    go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+    go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0
     if errorlevel 1 (
         echo [ERROR] Failed to install goversioninfo
         pause
@@ -31,7 +31,11 @@ set GOOS=windows
 set GOARCH=amd64
 set EXE=booster.exe
 go build -trimpath -ldflags="-s -w -buildid=" -o %EXE% ./cmd/booster
-if errorlevel 1 (
+set BUILD_ERR=%errorlevel%
+:: Ресурс Windows больше не нужен, а оставленный в папке он ломает
+:: последующую сборку под Linux/macOS.
+if exist cmd\booster\resource.syso del cmd\booster\resource.syso
+if not "%BUILD_ERR%"=="0" (
     echo [ERROR] Build failed
     pause
     exit /b 1

@@ -19,6 +19,7 @@ type runOptions struct {
 	isFlat      bool
 	workers     int
 	noGalleries bool
+	fullCheck   bool
 	cancel      *atomic.Bool
 	abort       *atomic.Bool
 	stats       *Stats
@@ -39,7 +40,9 @@ func run(ctx context.Context, opts runOptions) error {
 	logInfo("==================================================")
 
 	targetPostID := ""
-	if _, err := os.Stat(syncingPath); err == nil {
+	if opts.fullCheck {
+		logInfo("Полная проверка: просматриваются все посты автора.")
+	} else if _, err := os.Stat(syncingPath); err == nil {
 		logWarn("Предыдущая загрузка была прервана. Выполняется полная проверка.")
 	} else {
 		if data, err := os.ReadFile(latestPath); err == nil {
@@ -100,12 +103,14 @@ func run(ctx context.Context, opts runOptions) error {
 	newestPostID := ""
 	processedCount := 0
 	var postsErr error
+	postsClosed := false
 
 postsLoop:
 	for {
 		select {
 		case post, ok := <-posts:
 			if !ok {
+				postsClosed = true
 				break postsLoop
 			}
 			if opts.cancel.Load() {
@@ -193,6 +198,21 @@ postsLoop:
 
 		case <-ctx.Done():
 			break postsLoop
+		}
+	}
+
+	// Продюсер кладёт ошибку в errCh до закрытия posts, поэтому, если select
+	// выше выбрал закрытый posts, ошибка уже лежит в буфере. Без этой проверки
+	// оборванная пагинация засчитывалась как успех: .latest_post сдвигался на
+	// самый новый пост, и непросмотренные старые посты терялись навсегда.
+	if postsClosed {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				logError("Ошибка получения постов: %v", err)
+				postsErr = err
+			}
+		default:
 		}
 	}
 

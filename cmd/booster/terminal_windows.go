@@ -8,20 +8,34 @@ import (
 	"unsafe"
 )
 
-func init() {
-	// Включаем поддержку ANSI-escape последовательностей в Windows.
+// enableVirtualTerminalProcessing — флаг SetConsoleMode, включающий
+// поддержку ANSI-escape последовательностей.
+const enableVirtualTerminalProcessing = 0x0004
+
+var (
+	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
+	procGetConsoleMode             = kernel32.NewProc("GetConsoleMode")
+	procSetConsoleMode             = kernel32.NewProc("SetConsoleMode")
+	procGetConsoleScreenBufferInfo = kernel32.NewProc("GetConsoleScreenBufferInfo")
+)
+
+// ansiSupported включает обработку ANSI в консоли и сообщает, удалось ли.
+// Старые консоли (до Windows 10) флаг не принимают — тогда цвета и индикатор
+// прогресса выключаются, а не сыплют в вывод мусором вида «[K[33m».
+func ansiSupported() bool {
 	h, err := syscall.GetStdHandle(syscall.STD_ERROR_HANDLE)
-	if err == nil {
-		var mode uint32
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		procGet := kernel32.NewProc("GetConsoleMode")
-		procSet := kernel32.NewProc("SetConsoleMode")
-		ret, _, _ := procGet.Call(uintptr(h), uintptr(unsafe.Pointer(&mode)))
-		if ret != 0 {
-			mode |= 0x0004 // ENABLE_VIRTUAL_TERMINAL_PROCESSING
-			procSet.Call(uintptr(h), uintptr(mode))
-		}
+	if err != nil {
+		return false
 	}
+	var mode uint32
+	if ret, _, _ := procGetConsoleMode.Call(uintptr(h), uintptr(unsafe.Pointer(&mode))); ret == 0 {
+		return false // не консоль: вывод перенаправлен
+	}
+	if mode&enableVirtualTerminalProcessing != 0 {
+		return true
+	}
+	ret, _, _ := procSetConsoleMode.Call(uintptr(h), uintptr(mode|enableVirtualTerminalProcessing))
+	return ret != 0
 }
 
 // isTerminal сообщает, подключён ли файл к настоящей консоли.
@@ -29,9 +43,7 @@ func init() {
 // устройство, и при запуске из планировщика ожидание Enter печаталось бы зря.
 func isTerminal(f *os.File) bool {
 	var mode uint32
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	procGet := kernel32.NewProc("GetConsoleMode")
-	ret, _, _ := procGet.Call(f.Fd(), uintptr(unsafe.Pointer(&mode)))
+	ret, _, _ := procGetConsoleMode.Call(f.Fd(), uintptr(unsafe.Pointer(&mode)))
 	return ret != 0
 }
 
@@ -47,9 +59,7 @@ func terminalWidth() int {
 		Window            struct{ Left, Top, Right, Bottom int16 }
 		MaximumWindowSize struct{ X, Y int16 }
 	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	proc := kernel32.NewProc("GetConsoleScreenBufferInfo")
-	ret, _, _ := proc.Call(uintptr(h), uintptr(unsafe.Pointer(&csbi)))
+	ret, _, _ := procGetConsoleScreenBufferInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&csbi)))
 	if ret != 0 {
 		return int(csbi.Window.Right - csbi.Window.Left + 1)
 	}

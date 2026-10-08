@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -54,16 +56,26 @@ const (
 )
 
 var (
+	// errUnavailable — материал скачать нельзя в принципе (платная галерея,
+	// ссылка не на галерею). Это не сбой: такие задачи пропускаются и не
+	// мешают отметке синхронизации.
+	errUnavailable = errors.New("недоступно")
+
 	// errGalleryBlocked означает, что сайт перестал нас обслуживать.
 	errGalleryBlocked = errors.New("сайт галереи отклоняет запросы (вероятно, сработало ограничение частоты)")
 	// errNotGallery — ссылка ведёт на посторонний сайт, а не на wfolio.
-	errNotGallery = errors.New("не похоже на галерею wfolio")
+	errNotGallery = fmt.Errorf("%w: не похоже на галерею wfolio", errUnavailable)
 	// errGalleryNoDownload — скачивание закрыто владельцем либо галерея платная.
-	errGalleryNoDownload = errors.New("скачивание архива недоступно (возможно, галерея платная)")
+	errGalleryNoDownload = fmt.Errorf("%w: скачивание архива закрыто (возможно, галерея платная)", errUnavailable)
+	// errPrivateHost — ссылка ведёт во внутреннюю сеть пользователя.
+	errPrivateHost = fmt.Errorf("%w: ссылка ведёт на локальный или внутренний адрес", errUnavailable)
+	// errBadArchive — скачанный архив повреждён; он удаляется, чтобы
+	// следующая попытка скачала его заново.
+	errBadArchive = errors.New("архив повреждён")
 )
 
 var (
-	// diskPathRe вычленяет слаг галереи из пути вида /disk/lina-mc96q3.
+	// diskPathRe вычленяет слаг галереи из пути вида /disk/album-x1y2z3.
 	diskPathRe = regexp.MustCompile(`^/disk/([A-Za-z0-9][A-Za-z0-9._-]*)/?$`)
 	// tokenRe достаёт Rails-токен CSRF из формы скачивания.
 	tokenRe = regexp.MustCompile(`name="authenticity_token"[^>]*?value="([^"]+)"`)
@@ -79,6 +91,9 @@ var (
 type galleryClient struct {
 	http     *http.Client
 	interval time.Duration
+	// allowPrivate разрешает адреса внутренней сети — только для тестов
+	// с локальным httptest-сервером.
+	allowPrivate bool
 
 	mu       sync.Mutex
 	tokens   map[string]string // страница галереи → CSRF-токен
@@ -89,11 +104,60 @@ type galleryClient struct {
 
 func newGalleryClient() *galleryClient {
 	jar, _ := cookiejar.New(nil)
-	return &galleryClient{
-		http:     &http.Client{Timeout: galleryTimeout, Jar: jar},
+	c := &galleryClient{
 		interval: galleryInterval,
 		tokens:   map[string]string{},
 	}
+	c.http = &http.Client{
+		Timeout: galleryTimeout,
+		Jar:     jar,
+		// Переадресация проверяется так же, как исходная ссылка: иначе
+		// внешний сайт мог бы увести запрос во внутреннюю сеть.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("слишком много переадресаций")
+			}
+			return c.checkHost(req.Context(), req.URL)
+		},
+	}
+	return c
+}
+
+// checkHost не пускает запросы на локальные и внутренние адреса. Ссылки на
+// галереи берутся из текста постов, то есть их пишет автор, и без проверки
+// любая ссылка вида http://192.168.1.1/disk/x заставила бы программу
+// обращаться к устройствам в домашней сети пользователя.
+func (c *galleryClient) checkHost(ctx context.Context, u *url.URL) error {
+	if c.allowPrivate {
+		return nil
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%w: недопустимая схема %q", errUnavailable, u.Scheme)
+	}
+	host := u.Hostname()
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !isPublicAddr(ip) {
+			return errPrivateHost
+		}
+		return nil
+	}
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return err
+	}
+	for _, ip := range addrs {
+		if !isPublicAddr(ip) {
+			return errPrivateHost
+		}
+	}
+	return nil
+}
+
+func isPublicAddr(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsValid() && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsUnspecified() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast() &&
+		!netip.MustParsePrefix("100.64.0.0/10").Contains(ip) // CGNAT
 }
 
 // reserve выдаёт следующий разрешённый момент запроса. Слоты раздаются под
@@ -132,8 +196,8 @@ func (c *galleryClient) noteResult(rejected bool) {
 
 // galleryRef — разобранная ссылка на галерею.
 type galleryRef struct {
-	Base string // https://pavelkrasnov.com
-	Slug string // lina-mc96q3
+	Base string // https://photos.example.com
+	Slug string // album-x1y2z3
 }
 
 func (g galleryRef) pageURL() string { return g.Base + "/disk/" + g.Slug }
@@ -205,6 +269,9 @@ func (c *galleryClient) do(ctx context.Context, method, rawURL, referer string, 
 	if err != nil {
 		return "", "", err
 	}
+	if err := c.checkHost(ctx, req.URL); err != nil {
+		return "", "", err
+	}
 	req.Header.Set("User-Agent", galleryUserAgent)
 	// Accept строго */*. Заманчиво прислать «как браузер»
 	// (text/html,application/xhtml+xml,...), но тогда Rails выбирает другую
@@ -220,6 +287,8 @@ func (c *galleryClient) do(ctx context.Context, method, rawURL, referer string, 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
+		// Отказ проверки переадресации приходит обёрнутым в *url.Error;
+		// errors.Is доберётся до errUnavailable сквозь обёртку.
 		return "", "", err
 	}
 	defer resp.Body.Close()
@@ -284,7 +353,16 @@ func (c *galleryClient) archiveURL(ctx context.Context, ref galleryRef) (string,
 	if r == nil {
 		return "", fmt.Errorf("ссылка на архив не найдена в ответе")
 	}
-	return html.UnescapeString(r[1]), nil
+	archive := html.UnescapeString(r[1])
+	// Архив качает общий загрузчик, поэтому его адрес проверяется здесь же.
+	u, err := url.Parse(archive)
+	if err != nil {
+		return "", fmt.Errorf("некорректная ссылка на архив: %w", err)
+	}
+	if err := c.checkHost(ctx, u); err != nil {
+		return "", err
+	}
+	return archive, nil
 }
 
 // galleryTasks находит в посте ссылки на галереи и строит задачи загрузки.
@@ -305,7 +383,6 @@ func galleryTasks(ctx context.Context, c *galleryClient, post *Post, destDir str
 		}
 		stats.incGallery()
 
-		ref := ref
 		tasks = append(tasks, DownloadTask{
 			Dest:      dir + ".zip",
 			MediaType: "gallery",
@@ -355,7 +432,7 @@ func safeZipPath(name string) (string, bool) {
 }
 
 // stripCommonRoot убирает общий верхний каталог архива: галерея уже лежит
-// в своей папке, и лишний уровень вида Lina/ только удлиняет путь.
+// в своей папке, и лишний уровень вида Album/ только удлиняет путь.
 func stripCommonRoot(names []string) string {
 	root := ""
 	for _, n := range names {
@@ -379,6 +456,13 @@ func extractGallery(zipPath, destDir string) (int, error) {
 	// Архив закрывается до удаления: Windows не даёт удалить открытый файл.
 	count, err := unzipTo(zipPath, destDir)
 	if err != nil {
+		if errors.Is(err, errBadArchive) {
+			// Битый архив не исправится сам: удаляем, чтобы его скачали заново,
+			// а не спотыкались об него при каждом запуске.
+			if uerr := safeUnlink(zipPath); uerr != nil {
+				logWarn("Не удалось удалить повреждённый архив %s: %v", zipPath, uerr)
+			}
+		}
 		return count, err
 	}
 
@@ -396,7 +480,7 @@ func extractGallery(zipPath, destDir string) (int, error) {
 func unzipTo(zipPath, destDir string) (int, error) {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
-		return 0, fmt.Errorf("архив не открывается: %w", err)
+		return 0, fmt.Errorf("%w: %v", errBadArchive, err)
 	}
 	defer r.Close()
 
@@ -443,10 +527,19 @@ func unzipTo(zipPath, destDir string) (int, error) {
 	return count, nil
 }
 
+// zipCorruption помечает ошибки чтения, означающие повреждённый архив.
+func zipCorruption(err error) error {
+	if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) ||
+		errors.Is(err, zip.ErrAlgorithm) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: %v", errBadArchive, err)
+	}
+	return err
+}
+
 func writeZipEntry(f *zip.File, target string) error {
 	rc, err := f.Open()
 	if err != nil {
-		return err
+		return zipCorruption(err)
 	}
 	defer rc.Close()
 
@@ -460,7 +553,7 @@ func writeZipEntry(f *zip.File, target string) error {
 	if _, err := io.Copy(out, rc); err != nil {
 		out.Close()
 		_ = safeUnlink(tmp)
-		return err
+		return zipCorruption(err)
 	}
 	if err := out.Close(); err != nil {
 		_ = safeUnlink(tmp)

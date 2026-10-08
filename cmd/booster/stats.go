@@ -22,6 +22,9 @@ type Stats struct {
 	noAccess  int
 	cancelled int
 	external  int
+	// unavailable — задачи, которые скачать нельзя в принципе (платная
+	// галерея, ссылка не на галерею). Ошибкой не считаются.
+	unavailable int
 
 	processedBytes atomic.Int64
 	startTime      time.Time
@@ -70,6 +73,13 @@ func (s *Stats) incCancelled() {
 func (s *Stats) incExternal() {
 	s.mu.Lock()
 	s.external++
+	s.mu.Unlock()
+}
+
+// incUnavailable учитывает задачу, пропущенную как недоступную.
+func (s *Stats) incUnavailable() {
+	s.mu.Lock()
+	s.unavailable++
 	s.mu.Unlock()
 }
 
@@ -138,6 +148,7 @@ func (s *Stats) printSummary() {
 		{"Нет доступа:", s.noAccess},
 		{"Отменено:", s.cancelled},
 		{"Внешних видео:", s.external},
+		{"Недоступно:", s.unavailable},
 		{"Ошибок:", s.errors},
 		{"Итого:", s.totalLocked()},
 	}
