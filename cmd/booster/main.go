@@ -47,6 +47,7 @@ func main() {
 		"Не скачивать фото из внешних галерей, на которые ссылаются посты")
 	fullCheck := flag.Bool("full", false,
 		"Проверить все посты, а не только новые (например, после смены уровня подписки)")
+	messages := flag.Bool("messages", false, "Скачать также медиа из личной переписки с автором")
 	showVersion := flag.Bool("version", false, "Показать версию и выйти")
 	flag.Parse()
 
@@ -116,6 +117,7 @@ func main() {
 		}()
 		opts := runOptions{
 			author:      nick,
+			messages:    *messages,
 			token:       token,
 			outputDir:   outputDir,
 			isFlat:      *flat,

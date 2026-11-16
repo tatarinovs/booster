@@ -64,17 +64,11 @@ func newDownloadHTTPClient(workers int) *http.Client {
 	}
 }
 
-func warnRetry(attempt int, name string, err error) {
-	if attempt < maxDownloadRetries {
-		logWarn("Попытка %d/%d для %s: %v", attempt, maxDownloadRetries, name, err)
-	}
-}
-
 // retryDelay логирует предупреждение и засыпает перед следующей попыткой,
 // прерываясь по отмене контекста.
 func retryDelay(ctx context.Context, attempt int, name string, err error) {
-	warnRetry(attempt, name, err)
 	if attempt < maxDownloadRetries {
+		logWarn("Попытка %d/%d для %s: %v", attempt, maxDownloadRetries, name, err)
 		sleepCtx(ctx, downloadRetryDelay)
 	}
 }

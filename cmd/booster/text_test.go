@@ -289,7 +289,7 @@ func TestStatsCounters(t *testing.T) {
 	s.incNoAccess()
 	s.incCancelled()
 
-	if got := s.total(); got != 4 {
+	if got := s.totalLocked(); got != 4 {
 		t.Errorf("total = %d, ожидалось 4", got)
 	}
 	if got := s.errorCount(); got != 1 {

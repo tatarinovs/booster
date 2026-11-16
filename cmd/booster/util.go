@@ -98,21 +98,29 @@ func windowsRetry(fn func() error) error {
 	var lastErr error
 	for i := 0; i < 5; i++ {
 		err := fn()
-		if err == nil || os.IsNotExist(err) {
+		if err == nil {
 			return nil
 		}
 		lastErr = err
-		if runtime.GOOS != "windows" {
+		if runtime.GOOS != "windows" || os.IsNotExist(err) {
 			return lastErr
 		}
-		time.Sleep(500 * time.Millisecond)
+		if i < 4 {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 	return lastErr
 }
 
 // safeUnlink удаляет файл с повторными попытками (Windows держит файлы открытыми).
 func safeUnlink(path string) error {
-	return windowsRetry(func() error { return os.Remove(path) })
+	return windowsRetry(func() error {
+		err := os.Remove(path)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	})
 }
 
 // safeReplace атомарно переименовывает файл с повторными попытками.

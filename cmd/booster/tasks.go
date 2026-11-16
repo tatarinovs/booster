@@ -71,7 +71,6 @@ type DownloadTask struct {
 	Dest      string
 	MediaType string // "photo" | "video" | "audio" | "file"
 	Referer   string
-	IsVideo   bool
 
 	// PostID и MediaID позволяют перезапросить пост и получить свежую ссылку,
 	// если подписанная ссылка протухла, пока задача ждала в очереди.
@@ -151,86 +150,63 @@ func stripKnownExt(name, ext string) string {
 // makeTasks строит список задач загрузки для поста.
 func makeTasks(post *Post, destDir string, isFlat bool) []DownloadTask {
 	var tasks []DownloadTask
-	postURL := "https://boosty.to/posts/" + post.ID
-
 	for i, m := range post.Media {
-		idx := i + 1
-		var pfx string
-		if isFlat {
-			pfx = flatPrefix(post, idx)
-		} else {
-			pfx = fmt.Sprintf("%03d", idx)
-		}
-
+		var ext, stem, mediaType, referer string
 		switch m.Kind {
 		case MediaImage:
-			ext := imageExt(m.URL)
-			var fname string
-			if isFlat {
-				fname = pfx + ext
-			} else {
-				fname = fmt.Sprintf("%s_%s%s", pfx, m.ID, ext)
-			}
-			tasks = append(tasks, DownloadTask{
-				URL: m.URL, Dest: filepath.Join(destDir, fname), MediaType: "photo",
-				PostID: post.ID, MediaID: m.ID,
-			})
-
+			ext, stem, mediaType = imageExt(m.URL), m.ID, "photo"
 		case MediaVideo:
-			dlURL := m.bestURL()
-			if dlURL == "" {
-				logWarn("Нет доступных URL для видео %s в посте %s", m.ID, post.ID)
-				continue
-			}
-			title := truncateRunes(safeFilename(stripKnownExt(orDefault(m.Title, m.ID), ".mp4")), 100)
-			var fname string
-			if isFlat {
-				fname = pfx + ".mp4"
-			} else {
-				fname = fmt.Sprintf("%s_%s.mp4", pfx, title)
-			}
-			tasks = append(tasks, DownloadTask{
-				URL: dlURL, Dest: filepath.Join(destDir, fname), MediaType: "video",
-				Referer: postURL, IsVideo: true,
-				PostID: post.ID, MediaID: m.ID,
-			})
-
-		case MediaAudio, MediaFile:
-			if post.SignedQuery == "" {
-				logWarn("Нет signed_query для медиа в посте %s, пропускаем", post.ID)
-				continue
-			}
-			dlURL := signURL(m.URL, post.SignedQuery)
-			rawTitle := safeFilename(orDefault(m.Title, m.ID))
-
-			if m.Kind == MediaAudio {
-				title := truncateRunes(stripKnownExt(rawTitle, ".mp3"), 100)
-				var fname string
-				if isFlat {
-					fname = pfx + ".mp3"
-				} else {
-					fname = fmt.Sprintf("%s_%s.mp3", pfx, title)
-				}
-				tasks = append(tasks, DownloadTask{
-					URL: dlURL, Dest: filepath.Join(destDir, fname), MediaType: "audio",
-					PostID: post.ID, MediaID: m.ID,
-				})
-			} else {
-				ext := filepath.Ext(rawTitle)
-				stem := truncateRunes(strings.TrimSuffix(rawTitle, ext), 100)
-				var fname string
-				if isFlat {
-					fname = pfx + ext
-				} else {
-					fname = fmt.Sprintf("%s_%s%s", pfx, stem, ext)
-				}
-				tasks = append(tasks, DownloadTask{
-					URL: dlURL, Dest: filepath.Join(destDir, fname), MediaType: "file",
-					PostID: post.ID, MediaID: m.ID,
-				})
-			}
+			ext, mediaType = ".mp4", "video"
+			stem = truncateRunes(safeFilename(stripKnownExt(orDefault(m.Title, m.ID), ext)), 100)
+			referer = "https://boosty.to/posts/" + post.ID
+		case MediaAudio:
+			ext, mediaType = ".mp3", "audio"
+			stem = truncateRunes(stripKnownExt(safeFilename(orDefault(m.Title, m.ID)), ext), 100)
+		case MediaFile:
+			title := safeFilename(orDefault(m.Title, m.ID))
+			ext, mediaType = filepath.Ext(title), "file"
+			stem = truncateRunes(strings.TrimSuffix(title, ext), 100)
+		default:
+			continue
 		}
+		dlURL := mediaURL(post, &m)
+		if dlURL == "" {
+			logWarn("Нет доступной ссылки для вложения %s в посте %s", m.ID, post.ID)
+			continue
+		}
+		fname := fmt.Sprintf("%03d_%s%s", i+1, stem, ext)
+		if isFlat {
+			fname = flatPrefix(post, i+1) + ext
+		}
+		tasks = append(tasks, DownloadTask{
+			URL: dlURL, Dest: filepath.Join(destDir, fname), MediaType: mediaType,
+			Referer: referer, PostID: post.ID, MediaID: m.ID,
+		})
 	}
-
 	return tasks
+}
+
+// savePostText сохраняет текст через временный файл: неудачная запись
+// не должна оставлять обрезанный content.md, который пропустит следующий запуск.
+func savePostText(path string, post *Post) error {
+	info, err := os.Stat(path)
+	if err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("путь текста занят каталогом: %s", path)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	text := postToMarkdown(post.TextBlocks)
+	if text == "" {
+		return nil
+	}
+	pubDate := time.Unix(post.PublishTime, 0).UTC().Format("02.01.2006 15:04 UTC")
+	tmp := path + ".part"
+	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("Published %s\n\n%s", pubDate, text)), 0o644); err != nil {
+		return err
+	}
+	return safeReplace(tmp, path)
 }

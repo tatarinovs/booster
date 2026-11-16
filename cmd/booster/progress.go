@@ -26,6 +26,7 @@ var progress = &progressState{workers: map[int]string{}}
 func progressInit(total int, stats *Stats, workers int) {
 	logMu.Lock()
 	defer logMu.Unlock()
+	progress.donePosts = 0
 	progress.totalPosts = total
 	progress.stats = stats
 	progress.workerCount = workers

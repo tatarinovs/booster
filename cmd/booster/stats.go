@@ -108,13 +108,6 @@ func (s *Stats) addBytes(n int64) {
 	s.processedBytes.Add(n)
 }
 
-func (s *Stats) total() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.totalLocked()
-}
-
-// totalLocked — то же самое для вызывающего, который уже держит s.mu.
 func (s *Stats) totalLocked() int {
 	return s.photos + s.videos + s.audio + s.files + s.gallery
 }

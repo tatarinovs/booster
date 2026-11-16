@@ -133,7 +133,6 @@ func TestDownloadRefreshesExpiredURL(t *testing.T) {
 		URL:       srv.URL + "/stale.mp4",
 		Dest:      dest,
 		MediaType: "video",
-		IsVideo:   true,
 		PostID:    "post-1",
 		MediaID:   "vid-1",
 	})

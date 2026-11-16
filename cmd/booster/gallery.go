@@ -96,9 +96,8 @@ type galleryClient struct {
 	allowPrivate bool
 
 	mu       sync.Mutex
-	tokens   map[string]string // страница галереи → CSRF-токен
-	nextSlot time.Time         // не раньше этого момента можно слать запрос
-	failures int               // отказов подряд
+	nextSlot time.Time // не раньше этого момента можно слать запрос
+	failures int       // отказов подряд
 	blocked  bool
 }
 
@@ -106,7 +105,6 @@ func newGalleryClient() *galleryClient {
 	jar, _ := cookiejar.New(nil)
 	c := &galleryClient{
 		interval: galleryInterval,
-		tokens:   map[string]string{},
 	}
 	c.http = &http.Client{
 		Timeout: galleryTimeout,

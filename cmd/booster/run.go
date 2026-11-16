@@ -2,37 +2,57 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // runOptions — параметры одного запуска загрузки.
 type runOptions struct {
-	author      string
-	token       *AuthToken
-	outputDir   string
-	isFlat      bool
-	workers     int
-	noGalleries bool
-	fullCheck   bool
-	cancel      *atomic.Bool
-	abort       *atomic.Bool
-	stats       *Stats
+	messages      bool
+	messageSource bool
+	author        string
+	token         *AuthToken
+	outputDir     string
+	isFlat        bool
+	workers       int
+	noGalleries   bool
+	fullCheck     bool
+	cancel        *atomic.Bool
+	abort         *atomic.Bool
+	stats         *Stats
 }
 
 func run(ctx context.Context, opts runOptions) error {
+	postsErr := runContent(ctx, opts)
+	if !opts.messages || opts.cancel.Load() || ctx.Err() != nil {
+		return postsErr
+	}
+	opts.messageSource = true
+	messagesErr := runContent(ctx, opts)
+	return errors.Join(postsErr, messagesErr)
+}
+
+func runContent(ctx context.Context, opts runOptions) error {
+	initialFailures := opts.stats.errorCount()
 	authorDir := filepath.Join(opts.outputDir, safeFilename(opts.author))
+	if opts.messageSource {
+		authorDir = filepath.Join(authorDir, "messages")
+	}
 	if err := os.MkdirAll(authorDir, 0o755); err != nil {
 		return fmt.Errorf("не удалось создать папку %s: %w", authorDir, err)
 	}
 	failedPath := filepath.Join(authorDir, failedFilename)
 	syncingPath := filepath.Join(authorDir, ".syncing")
 	latestPath := filepath.Join(authorDir, ".latest_post")
+	if opts.messageSource {
+		latestPath = filepath.Join(authorDir, ".latest_message")
+		logInfo("Личная переписка с автором: %s", opts.author)
+	}
 
 	logInfo("==================================================")
 	logInfo("Автор: %s", opts.author)
@@ -63,11 +83,26 @@ func run(ctx context.Context, opts runOptions) error {
 	dlClient := newDownloadHTTPClient(opts.workers)
 	gallery := newGalleryClient()
 
-	total, err := client.blogPostCount(ctx, opts.author)
-	if err != nil {
-		return fmt.Errorf("не удалось получить число постов: %w", err)
+	total := 0
+	var err error
+	var dialogID, dialogSignature string
+	if opts.messageSource {
+		dialogID, dialogSignature, err = client.findDialog(ctx, opts.author)
+		var herr *httpError
+		if errors.As(err, &herr) && herr.status == 404 {
+			logInfo("Переписка с автором не найдена.")
+			_ = os.Remove(syncingPath)
+			return nil
+		}
+	} else {
+		total, err = client.blogPostCount(ctx, opts.author)
 	}
-	logInfo("Постов у автора: %d", total)
+	if err != nil {
+		return fmt.Errorf("не удалось получить источник загрузки: %w", err)
+	}
+	if !opts.messageSource {
+		logInfo("Постов у автора: %d", total)
+	}
 
 	progressInit(total, opts.stats, opts.workers)
 	stopTicker := make(chan struct{})
@@ -98,7 +133,13 @@ func run(ctx context.Context, opts runOptions) error {
 	// прерывается, и без отмены продюсер навсегда завис бы на отправке в канал.
 	postsCtx, postsCancel := context.WithCancel(ctx)
 	defer postsCancel()
-	posts, errCh := client.iterPosts(postsCtx, opts.author)
+	var posts <-chan Post
+	var errCh <-chan error
+	if opts.messageSource {
+		posts, errCh = client.iterMessages(postsCtx, dialogID, dialogSignature)
+	} else {
+		posts, errCh = client.iterPosts(postsCtx, opts.author)
+	}
 
 	newestPostID := ""
 	processedCount := 0
@@ -134,6 +175,10 @@ postsLoop:
 				progressPostDone()
 				continue
 			}
+			if opts.messageSource && len(post.Media) == 0 {
+				progressPostDone()
+				continue
+			}
 
 			var postDir string
 			if opts.isFlat {
@@ -142,6 +187,10 @@ postsLoop:
 				postDir = postDirName(authorDir, &post)
 				if err := os.MkdirAll(postDir, 0o755); err != nil {
 					logError("Не удалось создать папку поста %s: %v", postDir, err)
+					opts.stats.record("", false, true)
+					appendFailed(failedPath, postDir, "https://boosty.to/posts/"+post.ID)
+					progressPostDone()
+					continue
 				}
 			}
 
@@ -153,14 +202,10 @@ postsLoop:
 			} else {
 				tf = filepath.Join(postDir, contentFilename)
 			}
-			if _, err := os.Stat(tf); os.IsNotExist(err) {
-				if text := postToMarkdown(post.TextBlocks); text != "" {
-					pubDate := time.Unix(post.PublishTime, 0).UTC().Format("02.01.2006 15:04 UTC")
-					fullText := fmt.Sprintf("Published %s\n\n%s", pubDate, text)
-					if werr := os.WriteFile(tf, []byte(fullText), 0o644); werr != nil {
-						logError("Ошибка сохранения текста поста %s: %v", post.ID, werr)
-					}
-				}
+			if err := savePostText(tf, &post); err != nil {
+				logError("Ошибка сохранения текста поста %s: %v", post.ID, err)
+				opts.stats.record("", false, true)
+				appendFailed(failedPath, tf, "https://boosty.to/posts/"+post.ID)
 			}
 
 			// Внешние видео скачать нельзя — сохраняем ссылки, чтобы пост
@@ -172,7 +217,17 @@ postsLoop:
 			}
 
 			tasks := makeTasks(&post, postDir, opts.isFlat)
-			if !opts.noGalleries {
+			if opts.messageSource {
+				for i := range tasks {
+					messageID, mediaID := post.ID, tasks[i].MediaID
+					tasks[i].Referer = "https://boosty.to/app/messages/" + dialogID
+					tasks[i].PostID = ""
+					tasks[i].Resolve = func(ctx context.Context) (string, error) {
+						return client.refreshMessageMediaURL(ctx, dialogID, messageID, mediaID)
+					}
+				}
+			}
+			if !opts.noGalleries && !opts.messageSource {
 				tasks = append(tasks, galleryTasks(ctx, gallery, &post, postDir, opts.stats)...)
 			}
 
@@ -222,7 +277,7 @@ postsLoop:
 	progressFinish()
 
 	interrupted := opts.abort.Load() || opts.cancel.Load()
-	failures := opts.stats.errorCount()
+	failures := opts.stats.errorCount() - initialFailures
 
 	// Отметку «всё скачано» ставим, только если запуск прошёл полностью и без
 	// ошибок. Иначе быстрая синхронизация упёрлась бы в этот ID и до неудавшихся

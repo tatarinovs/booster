@@ -17,7 +17,7 @@ if errorlevel 1 (
 )
 
 :: Генерируем Windows-ресурс (иконка + версия)
-echo [1/3] Generating Windows resources (icon + version info)...
+echo [1/2] Generating Windows resources (icon + version info)...
 go generate ./cmd/booster
 if errorlevel 1 (
     echo [ERROR] go generate failed
@@ -26,7 +26,7 @@ if errorlevel 1 (
 )
 
 :: Собираем бинарник
-echo [2/3] Building booster.exe (windows/amd64)...
+echo [2/2] Building booster.exe (windows/amd64)...
 set GOOS=windows
 set GOARCH=amd64
 set EXE=booster.exe
@@ -39,15 +39,6 @@ if not "%BUILD_ERR%"=="0" (
     echo [ERROR] Build failed
     pause
     exit /b 1
-)
-
-:: Сжимаем UPX (опционально)
-where upx >nul 2>&1
-if not errorlevel 1 (
-    echo [3/3] Compressing with UPX...
-    upx --best --lzma %EXE%
-) else (
-    echo [3/3] UPX not found, skipping compression.
 )
 
 echo.
