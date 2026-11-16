@@ -28,78 +28,38 @@ jobs:
       - name: Тесты
         run: go test ./... -race -count=1
 
-      # Единственный источник номера версии — имя тега. Ни versioninfo.json,
-      # ни исходники руками править не нужно.
-      - name: Разобрать версию из тега
-        id: ver
+      - name: Check version tag
         run: |
-          raw="${GITHUB_REF_NAME}"
-          if [[ ! "$raw" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # Ручной запуск или нестандартный тег — версия нулевая, релиз не создаётся.
-            echo "full=$raw" >> "$GITHUB_OUTPUT"
-            echo "num=0.0.0" >> "$GITHUB_OUTPUT"
-            echo "major=0"   >> "$GITHUB_OUTPUT"
-            echo "minor=0"   >> "$GITHUB_OUTPUT"
-            echo "patch=0"   >> "$GITHUB_OUTPUT"
-            exit 0
+          version=$(cat internal/version/VERSION)
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag must match VERSION: v$version"
+            exit 1
           fi
-          n="${raw#v}"
-          # full — с префиксом (v1.2.3), num — без него: goversioninfo принимает
-          # в строковые поля только запись вида x.y.z.
-          echo "full=$raw"                        >> "$GITHUB_OUTPUT"
-          echo "num=$n"                           >> "$GITHUB_OUTPUT"
-          echo "major=${n%%.*}"                   >> "$GITHUB_OUTPUT"
-          echo "minor=$(echo "$n" | cut -d. -f2)" >> "$GITHUB_OUTPUT"
-          echo "patch=$(echo "$n" | cut -d. -f3)" >> "$GITHUB_OUTPUT"
 
       - name: Установить goversioninfo
         run: go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0
 
-      # Иконка и свойства файла для Windows. Номера версий передаются флагами,
-      # поэтому в свойствах exe оказывается ровно то, что в теге.
       - name: Ресурсы Windows (amd64)
         run: |
           cd cmd/booster
-          "$(go env GOPATH)/bin/goversioninfo" \
-            -icon=favicon.ico -manifest=booster.exe.manifest -64=true \
-            -ver-major=${{ steps.ver.outputs.major }} \
-            -ver-minor=${{ steps.ver.outputs.minor }} \
-            -ver-patch=${{ steps.ver.outputs.patch }} \
-            -ver-build=0 \
-            -product-ver-major=${{ steps.ver.outputs.major }} \
-            -product-ver-minor=${{ steps.ver.outputs.minor }} \
-            -product-ver-patch=${{ steps.ver.outputs.patch }} \
-            -product-ver-build=0 \
-            -file-version="${{ steps.ver.outputs.num }}" \
-            -product-version="${{ steps.ver.outputs.num }}"
+          go run ../../internal/winresources -arch=amd64
 
       - name: Сборка Windows amd64
         run: |
           mkdir -p dist
           GOOS=windows GOARCH=amd64 go build -trimpath \
-            -ldflags="-s -w -buildid= -X main.version=${{ steps.ver.outputs.full }}" \
+            -ldflags="-s -w -buildid=" \
             -o dist/booster.exe ./cmd/booster
 
       - name: Ресурсы Windows (x86)
         run: |
           cd cmd/booster
-          "$(go env GOPATH)/bin/goversioninfo" \
-            -icon=favicon.ico -manifest=booster.exe.manifest -64=false \
-            -ver-major=${{ steps.ver.outputs.major }} \
-            -ver-minor=${{ steps.ver.outputs.minor }} \
-            -ver-patch=${{ steps.ver.outputs.patch }} \
-            -ver-build=0 \
-            -product-ver-major=${{ steps.ver.outputs.major }} \
-            -product-ver-minor=${{ steps.ver.outputs.minor }} \
-            -product-ver-patch=${{ steps.ver.outputs.patch }} \
-            -product-ver-build=0 \
-            -file-version="${{ steps.ver.outputs.num }}" \
-            -product-version="${{ steps.ver.outputs.num }}"
+          go run ../../internal/winresources -arch=386
 
       - name: Сборка Windows 386
         run: |
           GOOS=windows GOARCH=386 go build -trimpath \
-            -ldflags="-s -w -buildid= -X main.version=${{ steps.ver.outputs.full }}" \
+            -ldflags="-s -w -buildid=" \
             -o dist/booster-x86.exe ./cmd/booster
 
       # Windows-ресурс ломает линковку под Linux и macOS — убираем.
@@ -111,7 +71,7 @@ jobs:
           set -e
           build() {
             GOOS=$1 GOARCH=$2 go build -trimpath \
-              -ldflags="-s -w -buildid= -X main.version=${{ steps.ver.outputs.full }}" \
+              -ldflags="-s -w -buildid=" \
               -o "dist/$3" ./cmd/booster
             echo "собрано: $3"
           }

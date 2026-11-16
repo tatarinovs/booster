@@ -186,3 +186,6 @@ cut -f3 external_links.txt | yt-dlp -a -
 - `progress.go` / `log.go` — однострочный индикатор прогресса и логирование
 - `run.go` — основной цикл (аналог `run()` в Python)
 - `util.go` — safeFilename, signURL, extractNickname, safeUnlink/Replace
+
+Version: edit `internal/version/VERSION` (`1.2.3`). All builds, `--version`,
+Windows file properties and manifest use this file. Release tags must match (`v1.2.3`).

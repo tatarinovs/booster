@@ -17,7 +17,7 @@ if errorlevel 1 (
 :: 1. Windows
 echo [*] Generating Windows (amd64) resources...
 cd cmd\booster
-goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest -64=true
+go run ../../internal/winresources -arch=amd64
 if errorlevel 1 (
     cd ..\..
     exit /b 1
@@ -31,15 +31,11 @@ set EXE_WIN=%OUTDIR%\booster.exe
 go build -trimpath -ldflags="-s -w -buildid=" -o %EXE_WIN% ./cmd/booster
 if errorlevel 1 exit /b 1
 
-where upx >nul 2>&1
-if not errorlevel 1 (
-    echo     Compressing %EXE_WIN%...
-    upx --best --lzma %EXE_WIN%
-)
-
+set GOOS=
+set GOARCH=
 echo [*] Generating Windows (x86) resources...
 cd cmd\booster
-goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest -64=false
+go run ../../internal/winresources -arch=386
 if errorlevel 1 (
     cd ..\..
     exit /b 1
@@ -53,12 +49,6 @@ set EXE_WIN_X86=%OUTDIR%\booster-x86.exe
 go build -trimpath -ldflags="-s -w -buildid=" -o %EXE_WIN_X86% ./cmd/booster
 if errorlevel 1 exit /b 1
 
-where upx >nul 2>&1
-if not errorlevel 1 (
-    echo     Compressing %EXE_WIN_X86%...
-    upx --best --lzma %EXE_WIN_X86%
-)
-
 :: Убираем Windows-ресурс, чтобы он не ломал линковку под Linux/macOS
 if exist cmd\booster\resource.syso del cmd\booster\resource.syso
 
@@ -70,12 +60,6 @@ set EXE_LINUX_AMD=%OUTDIR%\booster-linux-amd64
 go build -trimpath -ldflags="-s -w -buildid=" -o %EXE_LINUX_AMD% ./cmd/booster
 if errorlevel 1 exit /b 1
 
-where upx >nul 2>&1
-if not errorlevel 1 (
-    echo     Compressing %EXE_LINUX_AMD%...
-    upx --best --lzma %EXE_LINUX_AMD%
-)
-
 :: 3. Linux arm64
 echo [*] Building Linux (arm64)...
 set GOOS=linux
@@ -84,24 +68,12 @@ set EXE_LINUX_ARM=%OUTDIR%\booster-linux-arm64
 go build -trimpath -ldflags="-s -w -buildid=" -o %EXE_LINUX_ARM% ./cmd/booster
 if errorlevel 1 exit /b 1
 
-where upx >nul 2>&1
-if not errorlevel 1 (
-    echo     Compressing %EXE_LINUX_ARM%...
-    upx --best --lzma %EXE_LINUX_ARM%
-)
-
 echo [*] Building Linux (x86)...
 set GOOS=linux
 set GOARCH=386
 set EXE_LINUX_X86=%OUTDIR%\booster-linux-386
 go build -trimpath -ldflags="-s -w -buildid=" -o %EXE_LINUX_X86% ./cmd/booster
 if errorlevel 1 exit /b 1
-
-where upx >nul 2>&1
-if not errorlevel 1 (
-    echo     Compressing %EXE_LINUX_X86%...
-    upx --best --lzma %EXE_LINUX_X86%
-)
 
 :: 4. macOS amd64
 echo [*] Building macOS (amd64)...

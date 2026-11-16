@@ -1,4 +1,4 @@
-//go:generate goversioninfo -icon=favicon.ico -manifest=booster.exe.manifest -64=true
+//go:generate go run ../../internal/winresources -arch=amd64
 
 package main
 
@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/tatarinovs/booster/internal/version"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,10 +15,6 @@ import (
 	"syscall"
 	"time"
 )
-
-// version подставляется при сборке через -ldflags "-X main.version=v1.2.3".
-// В обычной сборке остаётся dev — так видно, что бинарник собран не из релиза.
-var version = "dev"
 
 func scriptDir() string {
 	exe, err := os.Executable()
@@ -52,7 +49,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("booster %s\n", version)
+		fmt.Printf("booster %s\n", "v"+version.Number)
 		return
 	}
 
