@@ -77,20 +77,6 @@ go build -trimpath -ldflags="-s -w -buildid=" -o booster.exe ./cmd/booster
 Если вы повысили уровень подписки, запустите программу один раз с `--full`:
 уже скачанные файлы будут пропущены, докачаются только новые.
 
-### Коды возврата
-
-Пригодятся, если запускаете из скрипта или планировщика:
-
-| Код | Значение |
-|-----|----------|
-| `0` | всё скачано без ошибок |
-| `1` | критическая ошибка (нет доступа к API, автор не найден) |
-| `2` | часть файлов не скачалась — см. `failed.txt` |
-| `130` | прервано пользователем (Ctrl+C) |
-
-При ошибках отметка синхронизации не обновляется, поэтому следующий запуск
-повторно обойдёт те же посты и докачает недостающее.
-
 ### Внешние галереи
 
 Некоторые авторы выкладывают полные съёмки во внешнюю галерею (платформа
@@ -173,6 +159,20 @@ cut -f3 external_links.txt | yt-dlp -a -
 
 > *Идея и оригинальный JS-скрипт авторизации позаимствованы из отличного проекта [lowfc/boosty_downloader](https://github.com/lowfc/boosty_downloader).*
 
+### Коды возврата
+
+Пригодятся, если запускаете из скрипта или планировщика:
+
+| Код | Значение |
+|-----|----------|
+| `0` | всё скачано без ошибок |
+| `1` | критическая ошибка (нет доступа к API, автор не найден) |
+| `2` | часть файлов не скачалась — см. `failed.txt` |
+| `130` | прервано пользователем (Ctrl+C) |
+
+При ошибках отметка синхронизации не обновляется, поэтому следующий запуск
+повторно обойдёт те же посты и докачает недостающее.
+
 ## Структура
 
 - `main.go` — CLI, сигналы, точка входа
@@ -187,5 +187,6 @@ cut -f3 external_links.txt | yt-dlp -a -
 - `run.go` — основной цикл (аналог `run()` в Python)
 - `util.go` — safeFilename, signURL, extractNickname, safeUnlink/Replace
 
-Version: edit `internal/version/VERSION` (`1.2.3`). All builds, `--version`,
-Windows file properties and manifest use this file. Release tags must match (`v1.2.3`).
+`build-releases.bat win` builds only Windows x64 as `booster.exe` in the
+project root. `build-win.bat` calls this command. Without arguments,
+`build-releases.bat` builds all platforms into `builds/`.

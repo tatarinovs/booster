@@ -1,8 +1,28 @@
 @echo off
 setlocal
 
-set OUTDIR=builds
+if not "%~1"=="" if /i not "%~1"=="win" (
+    echo Usage: %~nx0 [win]
+    exit /b 1
+)
+set "WIN_ONLY="
+if /i "%~1"=="win" set "WIN_ONLY=1"
+
+rem Read the compiler version from go.mod.
+cd /d "%~dp0"
+if errorlevel 1 exit /b 1
+for /f "tokens=1,2" %%A in (go.mod) do if "%%A"=="go" set "GOTOOLCHAIN=go%%B"
+set "CGO_ENABLED=0"
+set "GOOS="
+set "GOARCH="
+set "GOAMD64=v1"
+go version
+if errorlevel 1 exit /b 1
+
+set "OUTDIR=builds"
+if defined WIN_ONLY set "OUTDIR=."
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
+if errorlevel 1 exit /b 1
 
 echo === Booster Multi-Platform Release Builder ===
 echo.
@@ -12,6 +32,7 @@ where goversioninfo >nul 2>&1
 if errorlevel 1 (
     echo [*] goversioninfo not found, installing...
     go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0
+    if errorlevel 1 exit /b 1
 )
 
 :: 1. Windows
@@ -28,8 +49,16 @@ echo [*] Building Windows (amd64)...
 set GOOS=windows
 set GOARCH=amd64
 set EXE_WIN=%OUTDIR%\booster.exe
-go build -trimpath -ldflags="-s -w -buildid=" -o %EXE_WIN% ./cmd/booster
-if errorlevel 1 exit /b 1
+go build -trimpath -ldflags="-s -w -buildid=" -o "%EXE_WIN%" ./cmd/booster
+set "BUILD_ERR=%errorlevel%"
+if exist cmd\booster\resource.syso del cmd\booster\resource.syso
+if not "%BUILD_ERR%"=="0" exit /b %BUILD_ERR%
+if defined WIN_ONLY (
+    echo.
+    echo === Build complete: %EXE_WIN% ===
+    pause
+    exit /b 0
+)
 
 set GOOS=
 set GOARCH=
@@ -98,3 +127,4 @@ echo.
 echo Hint for macOS: to combine into a universal binary, run on a Mac:
 echo lipo -create -output %OUTDIR%\booster-macos %EXE_MAC_AMD% %EXE_MAC_ARM%
 pause
+exit /b 0

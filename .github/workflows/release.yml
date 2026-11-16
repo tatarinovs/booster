@@ -15,6 +15,9 @@ jobs:
   build:
     name: Сборка релиза
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+      GOAMD64: v1
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +29,7 @@ jobs:
       # Тесты прогоняются и здесь: тег может быть поставлен на коммит,
       # который не проходил CI.
       - name: Тесты
-        run: go test ./... -race -count=1
+        run: CGO_ENABLED=1 go test ./... -race -count=1
 
       - name: Check version tag
         run: |
